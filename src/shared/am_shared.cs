@@ -1,0 +1,556 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Threading;
+using System.Runtime.InteropServices;
+using System.Runtime.Serialization;
+using System.Runtime.Serialization.Json;
+using Microsoft.Win32;
+
+// V7 shared core: config, P/Invoke, window ops, silent pass.
+// Linked into both am.exe (CLI) and am-engine.exe (resident).
+// Self-contained: config/log/pid live next to the running exe (project dir).
+namespace AppManager.Shared
+{
+    [DataContract]
+    public class Item
+    {
+        [DataMember] public string name = "";
+        [DataMember] public string exe = "";             // target to launch: a .exe OR a script
+        [DataMember] public string processName = "";     // process to track = host when a launcher is used
+        [DataMember] public string windowTitle = "";
+        [DataMember] public int silentWindowMs = 0;      // monitor window after logon; 0 = default 30000ms
+        [DataMember] public string launcher = "";        // launcher id: built-in or custom
+        [DataMember] public string hostExe = "";         // custom host exe path (empty for built-in)
+        [DataMember] public string hostArgs = "";         // custom args template, {script} placeholder
+        [DataMember] public bool script = false;         // true => launch-only at logon (no window hiding)
+        [DataMember] public bool enabled = true;
+    }
+
+    [DataContract]
+    public class ExtLauncher
+    {
+        [DataMember] public string ext = "";        // ".lua" (with dot, lowercase)
+        [DataMember] public string id = "";         // launcher name
+        [DataMember] public string host = "";        // host exe absolute path or name
+        [DataMember] public string args = "";       // args template, {script} = target path
+        [DataMember] public string proc = "";       // process name to track
+    }
+
+    [DataContract]
+    public class Config
+    {
+        [DataMember] public List<Item> items = new List<Item>();
+        [DataMember] public List<ExtLauncher> extLaunchers = new List<ExtLauncher>();
+    }
+
+    public static class P
+    {
+        [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+        [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+        [DllImport("user32.dll")] public static extern bool EnumWindows(Delegate cb, IntPtr p);
+        public delegate bool EP(IntPtr h, IntPtr p);
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int max);
+    }
+
+    // ---------- script launchers: host interpreter + how to build the command line ----------
+    // A "launcher" is the host process that actually runs a script. The item's exe field
+    // is the target (script path); the launcher decides host exe + args + tracked process.
+    public static class Launchers
+    {
+        public class Def
+        {
+            public string Id;
+            public string[] Exts;
+            public string Host;            // absolute host exe (may be just a name for PATH-resolved)
+            public string ProcName;        // process name to track after launch
+            public Func<string, List<string>> Build;
+            public bool UseAbsoluteHost;   // if true, do a File.Exists check before start
+            public Def(string id, string[] exts, string host, string proc, bool useAbs, Func<string, List<string>> build)
+            { Id = id; Exts = exts; Host = host; ProcName = proc; UseAbsoluteHost = useAbs; Build = build; }
+        }
+
+        // built-in launchers. System ones use absolute paths so File.Exists check works.
+        static readonly List<Def> defs = new List<Def>
+        {
+            new Def("autohotkey", new[] { ".ahk" },
+                @"C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe", "AutoHotkey64", true,
+                s => new List<string> { s }),
+            new Def("powershell", new[] { ".ps1", ".psm1" },
+                @"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", "powershell", true,
+                s => new List<string> { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", s }),
+            new Def("cmd", new[] { ".bat", ".cmd" },
+                @"C:\Windows\System32\cmd.exe", "cmd", true,
+                s => new List<string> { "/d", "/c", s }),
+            new Def("wscript", new[] { ".vbs", ".js", ".jse" },
+                @"C:\Windows\System32\wscript.exe", "wscript", true,
+                s => new List<string> { s }),
+            new Def("python", new[] { ".py", ".pyw" },
+                "python.exe", "python", false,
+                s => new List<string> { "-B", s }),
+        };
+
+        // does the host exe for this launcher+script actually exist on disk?
+        public static bool HostExists(string launcher, string scriptPath)
+        {
+            var d = Resolve(launcher, scriptPath);
+            if (d == null) return false;
+            try { return !d.UseAbsoluteHost || File.Exists(d.Host); }
+            catch { return false; }
+        }
+
+        // list built-in launcher ids + extensions, for help / am launchers
+        public static string KnownList()
+        {
+            var sb = new StringBuilder();
+            foreach (var d in defs)
+            {
+                if (sb.Length > 0) sb.AppendLine();
+                sb.Append("  ").Append(d.Id).Append("  (");
+                string joined = "";
+                foreach (var e in d.Exts) joined += (joined.Length > 0 ? ", " : "") + e;
+                sb.Append(joined);
+                sb.Append(")  host=");
+                string h = d.UseAbsoluteHost ? System.IO.Path.GetFileName(d.Host) : d.Host;
+                sb.Append(h);
+            }
+            return sb.ToString().Trim();
+        }
+
+        // is this extension covered by a built-in launcher?
+        public static bool IsBuiltInExt(string scriptPath)
+        {
+            string ext = System.IO.Path.GetExtension(scriptPath).ToLowerInvariant();
+            foreach (var d in defs)
+                foreach (var e in d.Exts)
+                    if (e.Equals(ext, System.StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        // Resolve a launcher by explicit name, or auto-pick from the script extension.
+        // Returns null when no launcher can handle it (a bare .exe needs none).
+        public static Def Resolve(string launcher, string scriptPath)
+        {
+            string ext = System.IO.Path.GetExtension(scriptPath).ToLowerInvariant();
+            Def auto = null;
+            foreach (var d in defs)
+            {
+                bool owns = false;
+                foreach (var e in d.Exts) if (e.Equals(ext, System.StringComparison.OrdinalIgnoreCase)) { owns = true; break; }
+                if (owns && auto == null) auto = d;
+                if (!string.IsNullOrEmpty(launcher) && d.Id.Equals(launcher.Trim(), System.StringComparison.OrdinalIgnoreCase))
+                    return d;
+            }
+            if (string.IsNullOrEmpty(launcher)) return auto; // auto-pick by extension
+            return auto; // explicit launcher given but unknown -> fall back to extension match
+        }
+
+        // Look up a custom extension launcher from the learned list.
+        // Returns the matching ExtLauncher, or null.
+        public static ExtLauncher GetCustom(string ext, List<ExtLauncher> list)
+        {
+            if (list == null) return null;
+            string key = ext.ToLowerInvariant();
+            foreach (var e in list)
+                if (e.ext.Equals(key, System.StringComparison.OrdinalIgnoreCase)) return e;
+            return null;
+        }
+
+        // turn a built-in def into a raw args template string ("{script}" = target path)
+        public static string ToArgsTemplate(Def d)
+        {
+            var parts = d.Build("{script}");
+            var sb = new StringBuilder();
+            for (int i = 0; i < parts.Count; i++)
+            {
+                string tok = parts[i];
+                if (i > 0) sb.Append(" ");
+                if (tok != "{script}") sb.Append(Core.Quote(tok));
+                else sb.Append("{script}");
+            }
+            return sb.ToString();
+        }
+
+        // ---------- unified resolution: learned > builtin > custom host ----------
+        public class Resolved
+        {
+            public string Id;             // launcher id (display)
+            public string Host;           // host exe (path or bare name)
+            public string ArgsTemplate;   // e.g. "-NoProfile -ExecutionPolicy Bypass -File {script}"
+            public string Proc;           // process name to track
+            public bool FromLearned;
+            public bool FromBuiltin;
+            public bool FromCustom;
+        }
+
+        // resolve the effective launcher for a script path.
+        // Priority: explicit host > explicit launcher name > learned ext > built-in ext.
+        // Returns null if nothing matches (caller should reject).
+        public static Resolved ResolveFor(string scriptPath, string launcherName, string hostOverride, List<ExtLauncher> learned)
+        {
+            string ext = System.IO.Path.GetExtension(scriptPath);
+            ext = ext == null ? "" : ext.ToLowerInvariant();
+
+            // 1. explicit host override (most specific)
+            if (!string.IsNullOrEmpty(hostOverride))
+            {
+                string id = string.IsNullOrEmpty(launcherName)
+                    ? System.IO.Path.GetFileNameWithoutExtension(hostOverride)
+                    : launcherName.Trim();
+                string proc = id;
+                return new Resolved {
+                    Id = id, Host = hostOverride, ArgsTemplate = "{script}",
+                    Proc = proc, FromCustom = true
+                };
+            }
+
+            // 2. by launcher name (built-in or learned)
+            if (!string.IsNullOrEmpty(launcherName))
+            {
+                string ln = launcherName.Trim();
+                // built-in
+                foreach (var d in defs)
+                    if (d.Id.Equals(ln, System.StringComparison.OrdinalIgnoreCase))
+                    {
+                        return new Resolved {
+                            Id = d.Id, Host = d.Host, ArgsTemplate = ToArgsTemplate(d),
+                            Proc = d.ProcName, FromBuiltin = true
+                        };
+                    }
+                // learned
+                foreach (var e in learned)
+                    if (e != null && e.id.Equals(ln, System.StringComparison.OrdinalIgnoreCase))
+                    {
+                        return new Resolved {
+                            Id = e.id, Host = e.host, ArgsTemplate = e.args, Proc = e.proc,
+                            FromLearned = true
+                        };
+                    }
+                return null; // name not found anywhere
+            }
+
+            // 3. by extension: learned first, then built-in
+            if (!string.IsNullOrEmpty(ext))
+            {
+                // learned
+                foreach (var e in learned)
+                    if (e != null && e.ext.Equals(ext, System.StringComparison.OrdinalIgnoreCase))
+                    {
+                        return new Resolved {
+                            Id = e.id, Host = e.host, ArgsTemplate = e.args,
+                            Proc = e.proc, FromLearned = true
+                        };
+                    }
+                // built-in
+                foreach (var d in defs)
+                    foreach (var e in d.Exts)
+                        if (e.Equals(ext, System.StringComparison.OrdinalIgnoreCase))
+                        {
+                            return new Resolved {
+                                Id = d.Id, Host = d.Host, ArgsTemplate = ToArgsTemplate(d),
+                                Proc = d.ProcName, FromBuiltin = true
+                            };
+                        }
+            }
+            return null;
+        }
+
+        // record a learned mapping (auto or manual); replaces any existing entry for ext
+        public static void Learn(string ext, string id, string host, string args, string proc, List<ExtLauncher> list)
+        {
+            if (list == null) list = new List<ExtLauncher>();
+            ext = ext.ToLowerInvariant();
+            // remove existing entry for this ext, then add
+            for (int i = list.Count - 1; i >= 0; i--)
+                if (list[i] != null && list[i].ext.Equals(ext, System.StringComparison.OrdinalIgnoreCase))
+                    list.RemoveAt(i);
+            list.Add(new ExtLauncher { ext = ext, id = id, host = host, args = args, proc = proc });
+        }
+
+        // find a learned entry by extension (case-insensitive)
+        public static ExtLauncher FindByExt(string ext, List<ExtLauncher> list)
+        {
+            if (list == null) return null;
+            ext = ext.ToLowerInvariant();
+            foreach (var e in list)
+                if (e != null && e.ext.Equals(ext, System.StringComparison.OrdinalIgnoreCase)) return e;
+            return null;
+        }
+
+        // remove a learned entry by extension (case-insensitive)
+        public static void Forget(string ext, List<ExtLauncher> list)
+        {
+            if (list == null) return;
+            ext = ext.ToLowerInvariant();
+            for (int i = list.Count - 1; i >= 0; i--)
+                if (list[i] != null && list[i].ext.Equals(ext, System.StringComparison.OrdinalIgnoreCase))
+                    list.RemoveAt(i);
+        }
+    }
+
+    public static class Core
+    {
+        public const int SW_HIDE = 0, SW_SHOW = 5;
+        public const string EngineProcName = "am-engine";
+        public const string EngineExeName = "am-engine.exe";
+        public const string MutexName = "AppManagerResident";
+
+        // Self-contained: config/log/pid live next to the running exe (project dir).
+        static string Dir = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\', '/');
+        public static string CfgPath = Path.Combine(Dir, "config.json");
+        public static string LogPath = Path.Combine(Dir, "am.log");
+        public static string PidPath = Path.Combine(Dir, "am-engine.pid");
+        public static string StopPath = Path.Combine(Dir, "am-engine.stop.txt");
+
+        // ---------- config io ----------
+        public static Config Load()
+        {
+            Config c = null;
+            try
+            {
+                if (File.Exists(CfgPath))
+                {
+                    using (var fs = File.OpenRead(CfgPath))
+                    {
+                        var ser = new DataContractJsonSerializer(typeof(Config));
+                        c = (Config)ser.ReadObject(fs);
+                    }
+                }
+            }
+            catch { c = null; }
+            if (c == null) c = new Config();
+            // DataContractJsonSerializer leaves absent collection members as null; normalize
+            if (c.extLaunchers == null) c.extLaunchers = new List<ExtLauncher>();
+            if (c.items == null) c.items = new List<Item>();
+            return c;
+        }
+
+        public static void Save(Config c)
+        {
+            Directory.CreateDirectory(Dir);
+            using (var fs = File.Create(CfgPath))
+            {
+                var ser = new DataContractJsonSerializer(typeof(Config));
+                ser.WriteObject(fs, c);
+            }
+        }
+
+        public static void Log(string m)
+        {
+            try { Directory.CreateDirectory(Dir); File.AppendAllText(LogPath, DateTime.Now.ToString("HH:mm:ss") + "  " + m + Environment.NewLine); }
+            catch { }
+        }
+
+        // ---------- process / window helpers ----------
+        public static int ProcCount(string proc)
+        {
+            try { var a = Process.GetProcessesByName(proc); int n = a.Length; foreach (var p in a) p.Dispose(); return n; }
+            catch { return 0; }
+        }
+
+        public static bool StartApp(Item it)
+        {
+            string hostExe = it.exe;
+            string argsTemplate = "";
+            string procOverride = "";
+            if (it.script)
+            {
+                // try custom host first (from learned ext mapping or item-level)
+                if (!string.IsNullOrEmpty(it.hostExe))
+                {
+                    hostExe = it.hostExe;
+                    argsTemplate = it.hostArgs; // may contain {script}
+                }
+                else
+                {
+                    var def = Launchers.Resolve(it.launcher, it.exe);
+                    if (def == null) { Log("no launcher for '" + it.name + "' (" + it.exe + ")"); return false; }
+                    hostExe = def.Host;
+                    if (def.UseAbsoluteHost && !File.Exists(hostExe))
+                    { Log("host missing for '" + it.name + "': " + hostExe); return false; }
+                    var built = def.Build(it.exe);
+                    var sb = new StringBuilder();
+                    for (int i = 0; i < built.Count; i++)
+                        sb.Append((i == 0 ? "" : " ") + Core.Quote(built[i]));
+                    argsTemplate = sb.ToString();
+                    procOverride = def.ProcName;
+                }
+                if (string.IsNullOrEmpty(procOverride))
+                    procOverride = it.processName; // fall back to item's own processName
+                it.processName = procOverride;
+            }
+            if (string.IsNullOrEmpty(it.hostExe) && !it.script)
+            {
+                // plain exe: check it exists
+                if (!File.Exists(hostExe)) { Log("exe missing for '" + it.name + "': " + it.exe); return false; }
+            }
+            try
+            {
+                string args = "";
+                if (!string.IsNullOrEmpty(argsTemplate))
+                    args = argsTemplate.Replace("{script}", Core.Quote(it.exe));
+                var psi = new ProcessStartInfo(hostExe) { UseShellExecute = false };
+                psi.Arguments = args;
+                Process.Start(psi);
+                Log(string.Format("started '{0}' -> {1} {2}", it.name, hostExe, args));
+                return true;
+            }
+            catch (Exception ex) { Log("start failed '" + it.name + "': " + ex.Message); return false; }
+        }
+
+        // quote a single argument token for a raw command line
+        public static string Quote(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "\"\"";
+            if (s.IndexOf(' ') < 0 && s.IndexOf('"') < 0) return s;
+            return "\"" + s.Replace("\"", "\\\"") + "\"";
+        }
+
+        public static List<IntPtr> CollectWindows(string proc, string title)
+        {
+            var res = new List<IntPtr>();
+            var pids = new HashSet<uint>();
+            try
+            {
+                var ps = Process.GetProcessesByName(proc);
+                foreach (var p in ps) { pids.Add((uint)p.Id); p.Dispose(); }
+            }
+            catch { }
+            if (pids.Count == 0) return res;
+            P.EP cb = delegate(IntPtr h, IntPtr x)
+            {
+                uint pid;
+                P.GetWindowThreadProcessId(h, out pid);
+                if (pids.Contains(pid))
+                {
+                    if (string.IsNullOrEmpty(title)) { res.Add(h); }
+                    else
+                    {
+                        var sb = new StringBuilder(512);
+                        P.GetWindowText(h, sb, sb.Capacity);
+                        string t = sb.ToString();
+                        if (t.Contains(title)) res.Add(h);
+                    }
+                }
+                return true;
+            };
+            P.EnumWindows(cb, IntPtr.Zero);
+            return res;
+        }
+
+        public static int HideWindows(string proc, string title)
+        {
+            int n = 0;
+            foreach (var h in CollectWindows(proc, title))
+                if (P.IsWindowVisible(h) && P.ShowWindow(h, SW_HIDE)) n++;
+            return n;
+        }
+
+        public static int ShowWindows(string proc, string title)
+        {
+            int n = 0;
+            foreach (var h in CollectWindows(proc, title))
+                if (!P.IsWindowVisible(h) && P.ShowWindow(h, SW_SHOW)) n++;
+            return n;
+        }
+
+                // ---------- one pass: start-if-needed + continuous poll-hide for T seconds ----------
+        // Simple model: T = the entire monitoring window (--time per item, default 30s).
+        // During T, every 250ms we scan for visible windows and hide them.
+        // No distinction between "already running" vs "cold-started" - the window
+        // may pop up at any time during T, and we catch it on the next tick.
+        public static void DoPass(Config cfg)
+        {
+            var enabled = new List<Item>();
+            foreach (var i in cfg.items) if (i.enabled) enabled.Add(i);
+            if (enabled.Count == 0) { Log("pass: no enabled items"); return; }
+
+            const int iv = 250;        // poll interval
+            const int defT = 30000;   // default monitor window = 30s
+
+            // 1. Launch items that are not running yet
+            foreach (var it in enabled)
+            {
+                if (it.script)
+                {
+                    if (ProcCount(it.processName) == 0)
+                    {
+                        bool ok = StartApp(it);
+                        Log(string.Format("pass: '{0}' launched={1} (script, launch-only)", it.name, ok));
+                    }
+                    else
+                        Log(string.Format("pass: '{0}' already running (script, launch-only)", it.name));
+                }
+                else if (ProcCount(it.processName) == 0)
+                {
+                    bool ok = StartApp(it);
+                    Log(string.Format("pass: started '{0}' -> {1}", it.name, ok ? "ok" : "failed"));
+                }
+            }
+
+            // 2. Determine max T across app items
+            int maxT = 0;
+            foreach (var it in enabled)
+            {
+                if (it.script) continue;
+                int t = it.silentWindowMs > 0 ? it.silentWindowMs : defT;
+                if (t > maxT) maxT = t;
+            }
+
+            // 3. For maxT duration, every 250ms hide visible windows of app items
+            var sw = Stopwatch.StartNew();
+            int hides = 0;
+            while (sw.ElapsedMilliseconds < maxT)
+            {
+                foreach (var it in enabled)
+                {
+                    if (it.script) continue;
+                    hides += HideWindows(it.processName, it.windowTitle);
+                }
+                Thread.Sleep(iv);
+            }
+            Log(string.Format("pass done: {0} item(s), {1} hide-op(s), monitor {2}ms", enabled.Count, hides, maxT));
+        }
+public static Item FindItem(Config cfg, string name)
+        {
+            foreach (var i in cfg.items) if (string.Equals(i.name, name, StringComparison.OrdinalIgnoreCase)) return i;
+            return null;
+        }
+
+        // path of the engine exe (same directory as this assembly's deploy folder)
+        public static string EngineExe()
+        {
+            string d = AppDomain.CurrentDomain.BaseDirectory;
+            return Path.Combine(d, EngineExeName);
+        }
+
+        // is the engine alive? returns pid or 0
+        public static int EnginePid()
+        {
+            try
+            {
+                if (File.Exists(PidPath))
+                {
+                    int pid = int.Parse(File.ReadAllText(PidPath).Trim());
+                    var p = Process.GetProcessById(pid);
+                    if (p.ProcessName.IndexOf(EngineProcName, StringComparison.OrdinalIgnoreCase) >= 0)
+                        return pid;
+                }
+            }
+            catch { }
+            // fallback: by process name (first one)
+            try
+            {
+                var ps = Process.GetProcessesByName(EngineProcName);
+                int pid = 0;
+                foreach (var p in ps) { pid = p.Id; break; }
+                if (pid > 0) return pid;
+            }
+            catch { }
+            return 0;
+        }
+    }
+}
