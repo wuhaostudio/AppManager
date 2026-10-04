@@ -14,10 +14,10 @@ $shared   = Join-Path $devDir 'src\shared\am_shared.cs'
 if (-not (Test-Path $shared)) { throw "src\shared\am_shared.cs not found under $devDir" }
 New-Item $deployDir -ItemType Directory -Force | Out-Null
 
-function BuildExe($name, $target, $csFile) {
+function BuildExe($name, $target, $csFiles) {
   $out = Join-Path $deployDir "$name.exe"
   Remove-Item $out -Force -ErrorAction SilentlyContinue
-  $files = @($shared, (Join-Path $devDir $csFile))
+  $files = @($shared) + ($csFiles | ForEach-Object { Join-Path $devDir $_ })
   & $csc64 /nologo "/target:$target" "/out:$out" "/reference:$refArg" $files 2>&1 | ForEach-Object { Write-Output $_ }
   if (Test-Path $out) {
     $i = Get-Item $out
@@ -28,7 +28,7 @@ function BuildExe($name, $target, $csFile) {
 Write-Output "=== build dir: $devDir ==="
 Write-Output "=== deploy dir: $deployDir ==="
 Write-Output "building am.exe (CLI, console /target:exe) ..."
-BuildExe 'am' 'exe' 'src\cli\am_cli.cs'
-Write-Output "building am-engine.exe (engine, GUI /target:winexe) ..."
-BuildExe 'am-engine' 'winexe' 'src\engine\am_engine.cs'
+BuildExe 'am' 'exe' @('src\cli\am_cli.cs')
+Write-Output "building am-engine.exe (engine + picker UI, GUI /target:winexe) ..."
+BuildExe 'am-engine' 'winexe' @('src\engine\am_engine.cs', 'src\ui\am_picker.cs')
 Write-Output "done. Run scripts\install_am.ps1 to (re)point the logon task."

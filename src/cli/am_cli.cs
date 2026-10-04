@@ -2,6 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
 using AppManager.Shared;
 using Microsoft.Win32;
 
@@ -26,6 +29,7 @@ namespace AppManager.Cli
                 case "run": DoRun(); break;
                 case "stop": DoStop(); break;
                 case "launchers": DoLaunchers(args); break;
+                case "hotkey": DoHotkey(args); break;
                 default: Help(); break;
             }
             return 0;
@@ -380,8 +384,15 @@ namespace AppManager.Cli
             Console.WriteLine();
             foreach (var t in notes) Console.WriteLine("  " + t);
             int e = Core.EnginePid();
+            string hk = Hotkey.Parse(cfg.hotkey).Valid ? cfg.hotkey : "";
             Console.WriteLine(string.Format("  {0} item(s). engine: {1}   config: {2}",
                 cfg.items.Count, e > 0 ? "running (pid " + e + ")" : "not running", Core.CfgPath));
+            if (hk == "") Console.WriteLine("  HOTKEY: (none) — set one with 'am hotkey'");
+            else
+            {
+                Console.WriteLine("  HOTKEY: " + hk + "  (global app-picker shortcut; effective from next engine start)");
+                Console.WriteLine("  (press " + hk + " -> semi-transparent picker window: arrows select, Enter opens, Esc closes)");
+            }
         }
 
         // ---------- show ----------
@@ -552,6 +563,171 @@ namespace AppManager.Cli
             Console.WriteLine("usage: am launchers [list|learn|forget]");
         }
 
+        // ---------- hotkey: capture the global AppManager hotkey ----------
+        // Interactive capture: the user presses Enter to arm a round, then the
+        // hotkey combo anywhere on the keyboard; the round is confirmed with a
+        // second Enter. Two rounds must agree before config.json is written.
+        // No keyboard hooks: we poll GetAsyncKeyState and watch for the first
+        // up->down transition of an allowed key while snapshotting modifiers.
+        static void DoHotkey(string[] a)
+        {
+            string sub = a.Length >= 2 ? a[1].ToLowerInvariant() : "set";
+            if (sub == "clear")
+            {
+                var cfg = Core.Load();
+                string old = cfg.hotkey;
+                cfg.hotkey = "";
+                Core.Save(cfg);
+                Core.Log("cli hotkey clear" + (old != "" ? " (was " + old + ")" : ""));
+                Console.WriteLine(old == "" ? "no hotkey was configured" : "cleared hotkey '" + old + "'");
+                Console.WriteLine("Takes effect at next engine start (am stop && am run).");
+                return;
+            }
+            if (sub != "set")
+            {
+                Console.WriteLine("usage: am hotkey [set|clear]");
+                Console.WriteLine("  set    interactive capture (press the combo on your keyboard, two verifications)");
+                Console.WriteLine("  clear  remove the configured hotkey");
+                return;
+            }
+            RunHotkeyCapture();
+        }
+
+        static void RunHotkeyCapture()
+        {
+            var current = Core.Load();
+
+            Console.WriteLine();
+            Console.WriteLine("=== hotkey capture (round 1 of 2) ===");
+            if (!string.IsNullOrEmpty(current.hotkey))
+                Console.WriteLine("current hotkey: " + current.hotkey + " (will be replaced on success)");
+            Console.WriteLine("1) Press ENTER to start capturing");
+            Console.Write("   >> ");
+            Console.ReadLine();
+            Console.WriteLine("   Now press the desired hotkey combo on the keyboard (modifiers + one key, e.g. Ctrl+0).");
+            Console.WriteLine("   Allowed keys: letters A-Z, digits 0-9, F1-F24. Esc cancels the round. 60s timeout.");
+            var r1 = CaptureKeyCombo();
+            if (r1 == null) { Console.WriteLine("round 1 cancelled; nothing written."); return; }
+            Console.WriteLine("   captured: " + r1.Label);
+            Console.Write("   2) Press ENTER to confirm this combo: ");
+            Console.ReadLine();
+
+            Console.WriteLine();
+            Console.WriteLine("=== hotkey capture (round 2 of 2 — must match round 1) ===");
+            Console.WriteLine("   match target: " + r1.Label);
+            Console.Write("   1) Press ENTER to start capturing: ");
+            Console.ReadLine();
+            Console.WriteLine("   Now press the SAME combo again (e.g. " + r1.Label + "). Esc cancels the round.");
+            var r2 = CaptureKeyCombo();
+            if (r2 == null) { Console.WriteLine("round 2 cancelled; nothing written."); return; }
+            Console.WriteLine("   captured: " + r2.Label);
+            if (r2.Label != r1.Label)
+            {
+                Console.WriteLine("rounds disagree (" + r1.Label + " vs " + r2.Label + ") — nothing written.");
+                Console.WriteLine("retry with: am hotkey");
+                return;
+            }
+            Console.Write("   2) Press ENTER to confirm: ");
+            Console.ReadLine();
+
+            var cfg = Core.Load();
+            cfg.hotkey = r1.Label;
+            Core.Save(cfg);
+            Core.Log("cli hotkey set " + r1.Label);
+            Console.WriteLine("hotkey set to " + r1.Label);
+            Console.WriteLine("Takes effect at next engine start (am stop && am run).");
+            Console.WriteLine("The engine will listen with " + r1.Label + " and open the app picker window.");
+        }
+
+        // Polls the global keyboard state (~5ms cadence) for the first
+        // up->down transition of an allowed key, snapshotting the modifier
+        // state at that instant. Edge detection is previous-vs-current state
+        // per key (GetAsyncKeyState's transition bit is unreliable). Esc
+        // cancels; 60s timeout. A bare letter/digit is rejected: a global
+        // hotkey must carry a modifier (or be a bare F-key).
+        static Hotkey.Combo CaptureKeyCombo()
+        {
+            int[] keys = new int[10 + 26 + 24]; // 0-9, A-Z, F1-F24
+            int n = 0;
+            for (int c = '0'; c <= '9'; c++) keys[n++] = c;
+            for (int c = 'A'; c <= 'Z'; c++) keys[n++] = c;
+            for (int f = 0x70; f <= 0x87; f++) keys[n++] = f;
+
+            short[] prev = new short[keys.Length];
+            for (int i = 0; i < prev.Length; i++) prev[i] = KeyNative.GetAsyncKeyState(keys[i]);
+            prevEsc = (KeyNative.GetAsyncKeyState(0x1B) & 0x8000) != 0 ? 1 : 0;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < 60000)
+            {
+                // Esc cancels
+                if ((KeyNative.GetAsyncKeyState(0x1B) & 0x8000) != 0 && prevEsc == 0)
+                {
+                    Console.WriteLine("   Esc pressed - round cancelled.");
+                    FlushConsoleInput();
+                    return null;
+                }
+                prevEsc = (KeyNative.GetAsyncKeyState(0x1B) & 0x8000) != 0 ? 1 : 0;
+
+                for (int i = 0; i < keys.Length; i++)
+                {
+                    short cur = KeyNative.GetAsyncKeyState(keys[i]);
+                    bool downNow = (cur & 0x8000) != 0;
+                    bool wasDown = (prev[i] & 0x8000) != 0;
+                    if (downNow && !wasDown)
+                    {
+                        int mods = ModSnapshot();
+                        var combo = Hotkey.Parse(Hotkey.FormatCombo(mods, keys[i]));
+                        bool isF = keys[i] >= 0x70 && keys[i] <= 0x87;
+                        if (combo.Valid && (mods != 0 || isF))
+                        {
+                            FlushConsoleInput();
+                            return combo;
+                        }
+                        // bare letter/digit without modifier: reject, keep capturing
+                        Console.WriteLine("   '" + Hotkey.KeyLabel(keys[i]) + "' without a modifier is not a usable global hotkey.");
+                        Console.WriteLine("   Use modifier+key (e.g. Ctrl+0) or a bare F-key. Esc cancels. Press the combo again:");
+                        prev[i] = 0; // consume the press; wait for the next one
+                    }
+                    prev[i] = cur;
+                }
+                Thread.Sleep(5);
+            }
+            Console.WriteLine("   60s timeout - no key captured; round cancelled.");
+            return null;
+        }
+
+        static int prevEsc;
+
+        static int ModSnapshot()
+        {
+            int m = 0;
+            if ((KeyNative.GetAsyncKeyState(0x11) & 0x8000) != 0) m |= Hotkey.MOD_ALT;
+            if ((KeyNative.GetAsyncKeyState(0x12) & 0x8000) != 0) m |= Hotkey.MOD_CONTROL;
+            if ((KeyNative.GetAsyncKeyState(0x10) & 0x8000) != 0) m |= Hotkey.MOD_SHIFT;
+            if ((KeyNative.GetAsyncKeyState(0x5B) & 0x8000) != 0 || (KeyNative.GetAsyncKeyState(0x5C) & 0x8000) != 0) m |= Hotkey.MOD_WIN;
+            return m;
+        }
+
+        // drain any characters the capture keys buffered into the console, so
+        // the following "press ENTER" prompt is not pre-filled
+        static void FlushConsoleInput()
+        {
+            try
+            {
+                while (Console.KeyAvailable)
+                {
+                    try { Console.ReadKey(true); }
+                    catch { break; }
+                }
+            }
+            catch { }
+        }
+
+        static class KeyNative
+        {
+            [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vk);
+        }
+
         // ---------- help ----------
         static void Help()
         {
@@ -565,12 +741,15 @@ namespace AppManager.Cli
             Console.WriteLine("                   duplicate target path updates in place; broken config is rejected, not saved");
             Console.WriteLine("  add             interactive mode: ask path, name, title, launcher (if script)");
             Console.WriteLine("  remove <name>    remove a managed item");
-            Console.WriteLine("  list             all managed items with live state: APPS (running, windows, monitor, state) + SCRIPTS (running, launcher, state) + engine");
+            Console.WriteLine("  list             all managed items with live state: APPS (running, windows, monitor, state) + SCRIPTS (running, launcher, state) + engine + hotkey");
             Console.WriteLine("  show <name>       restore a hidden window (apps only)");
             Console.WriteLine("  start             one-shot pass (start-if-needed + hide), then exit");
             Console.WriteLine("  run               spawn the resident engine (detached), then CLI exits");
             Console.WriteLine("  stop              stop the engine");
             Console.WriteLine("  launchers [list|learn|forget]   view / add / remove extension→interpreter mappings");
+            Console.WriteLine("  hotkey [set|clear] set the global AppManager hotkey (interactive capture, two verifications);");
+            Console.WriteLine("                   the hotkey pops a semi-transparent picker window in the engine:");
+            Console.WriteLine("                   arrow keys select an app, Enter opens its window, Esc closes");
             Console.WriteLine();
             Console.WriteLine("Apps (.exe): launched + window hidden. Scripts (.ahk/.ps1/.bat/.vbs/.py/...): launch-only via host, no window hiding.");
             Console.WriteLine("MONITOR window: one fixed poll-hide time per app item (default 30s); scripts are launch-only.");

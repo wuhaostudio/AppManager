@@ -44,6 +44,107 @@ namespace AppManager.Shared
     {
         [DataMember] public List<Item> items = new List<Item>();
         [DataMember] public List<ExtLauncher> extLaunchers = new List<ExtLauncher>();
+        [DataMember] public string hotkey = "";   // global AppManager hotkey (e.g. "Ctrl+0"); empty = off
+    }
+
+    // ---------- global hotkey: parse / format ----------
+    // A hotkey is a modifier set (Ctrl/Alt/Shift/Win) + one non-modifier key
+    // (letter, digit, or F1..F24). Canonical label: "Ctrl+Alt+Shift+Win+X".
+    public static class Hotkey
+    {
+        public const int MOD_ALT = 0x1, MOD_CONTROL = 0x2, MOD_SHIFT = 0x4, MOD_WIN = 0x8;
+        public const int MOD_NOREPEAT = 0x4000;
+
+        public class Combo
+        {
+            public bool Valid;
+            public int Mods;      // MOD_* bitmask
+            public int Vk;        // VK code of the key (0 when invalid)
+            public string Label;  // canonical, e.g. "Ctrl+0"
+        }
+
+        // parse "Ctrl+0" / "alt+f1" / "a" (case-insensitive, tolerant of spaces)
+        public static Combo Parse(string s)
+        {
+            var c = new Combo { Label = "" };
+            if (string.IsNullOrWhiteSpace(s)) return c;
+            var toks = s.Trim().ToUpperInvariant().Split('+');
+            int mods = 0, vk = 0, keyToks = 0;
+            foreach (var t0 in toks)
+            {
+                string t = t0.Trim();
+                int m = ModWord(t);
+                if (m != 0) { if ((mods & m) != 0) return c; mods |= m; continue; }
+                int k = KeyToken(t);
+                if (k != 0) { if (++keyToks > 1) return c; vk = k; continue; }
+                return c; // unknown token
+            }
+            if (vk == 0) return c; // modifiers only (or nothing) is not a hotkey
+            c.Valid = true; c.Mods = mods; c.Vk = vk;
+            c.Label = FormatCombo(mods, vk);
+            return c;
+        }
+
+        static int ModWord(string t)
+        {
+            switch (t)
+            {
+                case "CTRL": case "CONTROL": return MOD_CONTROL;
+                case "ALT": case "ALTERNATE": return MOD_ALT;
+                case "SHIFT": return MOD_SHIFT;
+                case "WIN": case "WINDOWS": case "META": return MOD_WIN;
+                default: return 0;
+            }
+        }
+
+        // single key token -> VK code (0 when not a key). ASCII letters/digits double as their VK codes.
+        static int KeyToken(string t)
+        {
+            if (t.Length == 1)
+            {
+                char ch = t[0];
+                if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) return ch;
+                return 0;
+            }
+            if (t.Length >= 2 && t[0] == 'F')
+            {
+                int n;
+                if (int.TryParse(t.Substring(1), out n) && n >= 1 && n <= 24) return 0x70 + n - 1;
+            }
+            return 0;
+        }
+
+        // canonical label from a MOD_* mask + VK
+        public static string FormatCombo(int mods, int vk)
+        {
+            var parts = new List<string>();
+            if ((mods & MOD_CONTROL) != 0) parts.Add("Ctrl");
+            if ((mods & MOD_ALT) != 0) parts.Add("Alt");
+            if ((mods & MOD_SHIFT) != 0) parts.Add("Shift");
+            if ((mods & MOD_WIN) != 0) parts.Add("Win");
+            parts.Add(KeyLabel(vk));
+            return string.Join("+", parts);
+        }
+
+        public static string KeyLabel(int vk)
+        {
+            if (vk >= 0x30 && vk <= 0x39) return ((char)vk).ToString();
+            if (vk >= 0x41 && vk <= 0x5A) return ((char)vk).ToString();
+            if (vk >= 0x70 && vk <= 0x87) return "F" + (vk - 0x70 + 1);
+            return "?";
+        }
+
+        // MOD_* values double as the RegisterHotKey modifier flags
+        // (MOD_ALT=0x1, MOD_CONTROL=0x2, MOD_SHIFT=0x4, MOD_WIN=0x8).
+        public static int RegisterMods(int mods)
+        {
+            int r = 0;
+            if ((mods & MOD_CONTROL) != 0) r |= 0x2;
+            if ((mods & MOD_ALT) != 0) r |= 0x1;
+            if ((mods & MOD_SHIFT) != 0) r |= 0x4;
+            if ((mods & MOD_WIN) != 0) r |= 0x8;
+            return r | MOD_NOREPEAT;
+        }
     }
 
     public static class P
@@ -54,6 +155,7 @@ namespace AppManager.Shared
         public delegate bool EP(IntPtr h, IntPtr p);
         [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int max);
+        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     }
 
     // ---------- script launchers: host interpreter + how to build the command line ----------
@@ -325,6 +427,7 @@ namespace AppManager.Shared
             // DataContractJsonSerializer leaves absent collection members as null; normalize
             if (c.extLaunchers == null) c.extLaunchers = new List<ExtLauncher>();
             if (c.items == null) c.items = new List<Item>();
+            if (c.hotkey == null) c.hotkey = "";
             return c;
         }
 

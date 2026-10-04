@@ -43,6 +43,7 @@ CLI 与引擎**没有 IPC**，只通过 `config.json`、pid 文件和 OS 进程�
 - **静默启动** — 每个条目先按需启动，再隐藏其窗口（按进程名匹配，可选按标题子串过滤）
 - **每条目监控时长** — 每个 app 条目一个统一监控时长（默认 30s）；`--time` 支持 `15s`、`30`、`5000ms` 写法；脚本项不做轮询藏窗，无默认监控时间
 - **持续监控** — 登录启动后，`--time` 窗口期内每 250ms 持续藏窗，窗口晚弹也能追上
+- **全局热键选单** — 一条 `am hotkey` 设全局快捷键（如 `Ctrl+0`），随时弹出半透明应用选单：方向键选中、Enter 打开、Esc 关闭；开窗 1.5s 后自动让位（释放 TOPMOST），平时不挡路
 - **一键找回** — `am show <name>` 恢复被隐藏窗口
 - **程序发现** — `am scan [keyword]` 读注册表 Uninstall 键，自动推断 exe
 - **交互式添加** — 不带参数 `am add` 进入逐步问答模式
@@ -78,6 +79,8 @@ am add "C:\path\app.exe"         # 最简添加（默认 30s、藏全部窗口�
 am add "C:\path\app.exe" --name MyApp --title 主窗口 --time 30s
 am add                           # 交互式（逐问答）
 am list                          # 查看全部条目 + 运行状态（APPS / SCRIPTS 分区）
+am hotkey                        # 设置全局热键（交互捕获，两次确认）
+am hotkey clear                  # 清除热键
 am show MyApp                    # 恢复窗口
 am remove MyApp                  # 移除条目
 am start                         # 一次性拉起+藏窗后退出
@@ -98,9 +101,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\uninstall_am.ps1
 ```
 C:\project\AppManager\              ← 开发/源码（本目录）
 ├── src\
-│   ├── shared\am_shared.cs    # 共享核心：配置模型、P/Invoke、DoPass、Launchers
+│   ├── shared\am_shared.cs    # 共享核心：配置模型、P/Invoke、DoPass、Launchers、Hotkey
 │   ├── cli\am_cli.cs          # CLI 入口
-│   └── engine\am_engine.cs    # 引擎入口
+│   ├── engine\am_engine.cs    # 引擎入口（静默启动 + 热键监听）
+│   └── ui\am_picker.cs        # 应用选单窗口（全局热键弹出，编译进引擎）
+├── tests\
+│   └── picker_test.cs         # 选单最终验收测试（A 渲染 / B 层级 / C 拖拽 / D 逻辑）
 ├── scripts\
 │   ├── install_am.ps1         # 注册登录任务
 │   └── uninstall_am.ps1       # 卸载
@@ -198,6 +204,22 @@ am add <exe|script> [--name n] [--title t] [--time 时长] [--launcher 名称]
 
 不带任何参数直接 `am add` → 交互问答模式。
 
+## 全局热键（应用选单）
+
+给所有管理项一个"随时找回"的图形入口：引擎常驻时按一次全局热键（默认未设置，如 `Ctrl+0`）就弹出半透明应用选单——方向键移动选中项，`Enter` 打开该应用的窗口（未运行则先启动），`Esc` 或再按一次热键关闭。
+
+```bash
+am hotkey            # 交互捕获：按两次 Enter 分段确认，两轮输入一致才写入
+am hotkey clear      # 清除热键（引擎下次启动后监听关闭）
+```
+
+行为细节：
+
+- **捕获方式**：无键盘钩子，引擎侧是标准 `RegisterHotKey`；CLI 侧用 `GetAsyncKeyState` 轮询全局键盘状态。裸字母/数字键被拒绝（全局热键必须带修饰键或为 F 键），两次独立捕获必须一致才写入配置，防误触
+- **不挡路**：选单开窗时置顶，~1.5 秒后自动释放 TOPMOST，普通应用可随时盖过它；可拖标题栏移动、拖边角缩放
+- **生效时机**：下次引擎启动时加载（`am stop && am run`）；引擎未运行时热键不生效
+- 选单列表来自当前 `config.json`，脚本项照常显示（只启动不藏窗）
+
 ## 配置（config.json）
 
 ```json
@@ -218,7 +240,8 @@ am add <exe|script> [--name n] [--title t] [--time 时长] [--launcher 名称]
   ],
   "extLaunchers": [
     { "ext": ".lua", "id": "luajit", "host": "C:\\Tools\\luajit.exe", "args": "{script}", "proc": "luajit" }
-  ]
+  ],
+  "hotkey": "Ctrl+0"
 }
 ```
 
@@ -235,6 +258,7 @@ am add <exe|script> [--name n] [--title t] [--time 时长] [--launcher 名称]
 | `script` | true = 脚本项（只启动不藏窗） |
 | `enabled` | 是否启用 |
 | `extLaunchers[]` | 学习映射表（ext → 宿主） |
+| `hotkey` | 全局热键（如 `"Ctrl+0"`；空 = 关闭），由 `am hotkey` 维护 |
 
 ## 监控时序
 

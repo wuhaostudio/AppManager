@@ -43,6 +43,7 @@ The CLI and the engine have **no IPC** between them — they coordinate only via
 - **Silent start** — each item is started on demand, then its windows are hidden (matched by process name, optionally filtered by title substring)
 - **Per-item monitor time** — a unified poll-hide monitor duration per app item (default 30s); script items have no monitor time (launch-only); `--time` accepts `15s`, `30`, `5000ms`
 - **Continuous monitor** — after logon the engine re-hides windows every 250ms for the whole monitor window, so late popups get caught too
+- **Global hotkey picker** — one `am hotkey` sets a global shortcut (e.g. `Ctrl+0`) that pops a semi-transparent app picker: arrows select, Enter opens, Esc closes; TOPMOST is auto-released ~1.5s after opening so it never blocks you
 - **One-line restore** — `am show <name>` brings a hidden window back
 - **Program discovery** — `am scan [keyword]` reads the registry Uninstall keys and infers the real exe
 - **Interactive add** — bare `am add` drops into a step-by-step Q&A
@@ -78,6 +79,8 @@ am add "C:\path\app.exe"         # minimal add (default 30s, hide all windows)
 am add "C:\path\app.exe" --name MyApp --title MainWindow --time 30s
 am add                           # interactive (Q&A)
 am list                          # all items + live state (APPS / SCRIPTS sections)
+am hotkey                        # set the global hotkey (interactive capture, two confirmations)
+am hotkey clear                  # remove the hotkey
 am show MyApp                    # restore window
 am remove MyApp                  # remove entry
 am start                         # one-shot: start + hide, then exit
@@ -98,9 +101,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\uninstall_am.ps1
 ```
 C:\project\AppManager\              ← dev / source
 ├── src\
-│   ├── shared\am_shared.cs    # shared core: config model, P/Invoke, DoPass, Launchers
+│   ├── shared\am_shared.cs    # shared core: config model, P/Invoke, DoPass, Launchers, Hotkey
 │   ├── cli\am_cli.cs          # CLI entry point
-│   └── engine\am_engine.cs    # engine entry point
+│   ├── engine\am_engine.cs    # engine entry (silent start + hotkey listener)
+│   └── ui\am_picker.cs        # app picker window (global hotkey, compiled into the engine)
+├── tests\
+│   └── picker_test.cs         # picker acceptance test (A render / B z-order / C drag / D logic)
 ├── scripts\
 │   ├── install_am.ps1         # register the logon task
 │   └── uninstall_am.ps1       # uninstall
@@ -198,6 +204,22 @@ am add <exe|script> [--name n] [--title t] [--time duration] [--launcher id]
 
 Bare `am add` with no arguments → interactive Q&A mode.
 
+## Global hotkey (app picker)
+
+A graphical "find me anytime" entry for every managed item: while the engine is resident, pressing the global hotkey (none by default, e.g. `Ctrl+0`) pops a semi-transparent app picker — arrows move the selection, Enter opens the app's window (starting it first if not running), Esc or pressing the hotkey again closes it.
+
+```bash
+am hotkey            # interactive capture: two Enter-gated rounds, written only when both agree
+am hotkey clear      # remove the hotkey (listener goes off at next engine start)
+```
+
+Behavior details:
+
+- **Capture**: no keyboard hooks — the engine side uses the standard `RegisterHotKey`; the CLI side polls global keyboard state via `GetAsyncKeyState`. Bare letters/digits are rejected (a global hotkey must carry a modifier or be an F-key); two independent captures must agree before the config is written, guarding against typos
+- **Never blocks**: the picker opens topmost, then TOPMOST is released ~1.5s after opening so ordinary apps can cover it; the window can be dragged by its caption and resized from the corner
+- **Effective from**: the next engine start (`am stop && am run`); while the engine is not running the hotkey does nothing
+- The picker lists the current `config.json`; script items show up as usual (launch-only, no hiding)
+
 ## Configuration (config.json)
 
 ```json
@@ -218,7 +240,8 @@ Bare `am add` with no arguments → interactive Q&A mode.
   ],
   "extLaunchers": [
     { "ext": ".lua", "id": "luajit", "host": "C:\\Tools\\luajit.exe", "args": "{script}", "proc": "luajit" }
-  ]
+  ],
+  "hotkey": "Ctrl+0"
 }
 ```
 
