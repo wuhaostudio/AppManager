@@ -5,6 +5,11 @@ am.log
 am-engine.pid
 am-engine.stop.txt
 
+# dev-process docs (local only, not for the public repo)
+Intent.md
+Spec.md
+HANDOFF.md
+
 # OS noise
 Thumbs.db
 .DS_Store
