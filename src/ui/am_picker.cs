@@ -19,10 +19,11 @@ using AppManager.Shared;
 // Look & feel (verified interactively with tests/window_probe.cs):
 //   - borderless dark window (Opacity 0.7 when idle), custom dark title bar
 //     with minimize / maximize / close buttons at the right edge
-//   - native move (drag the title bar) and native resize (drag edges/corners)
-//     via ReleaseCapture + WM_NCLBUTTONDOWN — the same system path as
-//     dragging a normal window, so no jitter; opacity goes to 1.0 while the
-//     native move/resize is in flight (DWM composites semi-transparent
+//   - self-drawn move (drag the title bar) and self-drawn resize (drag the
+//     6px edges/corners): the picker captures the mouse and follows the
+//     cursor itself. The system's native NC drag loop cannot be driven by
+//     synthesized input, which made the behaviour untestable; opacity goes to
+//     1.0 while a move/resize is in flight (DWM composites semi-transparent
 //     windows slowly while they move) and back to 0.7 on release
 //   - TOPMOST on open, released ~1.5s later (WinForms TopMost toggle, no
 //     window recreation needed) so ordinary apps can come forward normally
@@ -48,10 +49,6 @@ namespace AppManager.Ui
 
         [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
 
-        [DllImport("user32.dll")] static extern void ReleaseCapture();
-
-        [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
-
         [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
 
         [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
@@ -61,8 +58,6 @@ namespace AppManager.Ui
         [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
 
         [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
-
-        const int WM_NCLBUTTONDOWN = 0xA1;
 
 
 
@@ -201,7 +196,11 @@ namespace AppManager.Ui
             Label hdrA, hdrS, status, title;
             ListBox listA, listS;
             Button minBtn, maxBtn, closeBtn;
-            bool inNativeOp;
+            bool inNativeOp;           // a self-drawn move/resize is in flight
+            Point opCursor, opWin;     // cursor + window position when it started
+            Size opSize;               // window size when it started
+            int opHt;                  // 0 = move, else the grabbed edge (HT code)
+            Control opCap;             // control holding the mouse capture
             bool syncing;               // guard: list handlers vs programmatic selects
 
             System.Windows.Forms.Timer poller;
@@ -377,59 +376,31 @@ namespace AppManager.Ui
 
 
 
-                // ---- native move: drag the title bar (system handles it, no jitter) ----
-                tb.MouseDown += (s, e) =>
+                // ---- self-drawn move (title bar) + resize (edges/corners) ----
+                // The system's native NC drag loop (ReleaseCapture +
+                // WM_NCLBUTTONDOWN) cannot be driven by synthesized mouse
+                // input, so the picker moves itself: grab the mouse, follow
+                // the cursor, write Location/Bounds. Same feel for the user,
+                // scriptable for the acceptance test.
+                HookCaption(tb);
+                HookCaption(title);   // the caption label covers most of the bar
 
-                {
-
-                    if (e.Button != MouseButtons.Left) return;
-
-                    inNativeOp = true;
-
-                    Opacity = 1.0;
-
-                    ReleaseCapture();
-
-                    SendMessage(Handle, WM_NCLBUTTONDOWN, new IntPtr(2 /*HTCAPTION*/), IntPtr.Zero);
-
-                };
-
-                tb.MouseUp += (s, e) => { if (inNativeOp) { inNativeOp = false; Opacity = OPACITY; } };
-
-
-
-                // ---- native resize: 4 edges + 4 corners ----
-                MouseDown += (s, e) =>
-
-                {
-
-                    if (e.Button != MouseButtons.Left) return;
-
-                    int ht = HitCode(e.X, e.Y);
-
-                    if (ht == 0) return;
-
-                    inNativeOp = true;
-
-                    Opacity = 1.0;
-
-                    ReleaseCapture();
-
-                    SendMessage(Handle, WM_NCLBUTTONDOWN, new IntPtr(ht), IntPtr.Zero);
-
-                };
-
-                MouseUp += (s, e) => { if (inNativeOp) { inNativeOp = false; Opacity = OPACITY; } };
-
-                MouseMove += (s, e) => { if (!inNativeOp) Cursor = CursorFor(HitCode(e.X, e.Y)); };
+                // The docked panels and list boxes cover the client area, so
+                // the 6px grab border is detected on them (screen space).
+                HookGrip(body);
+                HookGrip(status);
+                if (listA != null) HookGrip(listA);
+                if (listS != null) HookGrip(listS);
 
 
 
                 // ---- focus: steal it for this picker's lifetime so that
-                //   (a) native key events (arrows in a focused listbox) land
-                //        here instead of the app that had the keyboard;
-                //   (b) the picker's own GetAsyncKeyState polls see a
-                //        consistent foreground for its toggle.
+                //   (a) the picker's own GetAsyncKeyState polls see a
+                //        consistent foreground for its toggle, and no child
+                //        control competes for the arrow/Enter keys (they are
+                //        all non-selectable, so the form keeps focus);
+                //   (b) keystrokes never land in the app that had the
+                //        keyboard before the hotkey fired.
                 // The hotkey fired globally, so we have no input of our own:
                 // attach to the current foreground thread to be allowed to
                 // activate.
@@ -521,11 +492,29 @@ namespace AppManager.Ui
 
 
 
+            // The lists must never take focus: keyboard is handled ONLY by the
+
+            // global GetAsyncKeyState poller below. A focusable ListBox also
+
+            // processes the arrow keys natively, so a single physical Down was
+
+            // applied twice (native row move + poller) and rows were skipped.
+
+            class NonSelectList : ListBox
+
+            {
+
+                public NonSelectList() { SetStyle(ControlStyles.Selectable, false); TabStop = false; }
+
+            }
+
+
+
             ListBox NewList()
 
             {
 
-                var lb = new ListBox
+                var lb = new NonSelectList
 
                 {
 
@@ -719,11 +708,29 @@ namespace AppManager.Ui
 
 
 
+            // Title-bar buttons must not take focus either: once the lists are
+
+            // non-selectable WinForms hands focus to the first Button, and a
+
+            // plain Enter press would "click" it (closing the picker) instead
+
+            // of reaching the poller's Enter handling.
+
+            class NonSelectButton : Button
+
+            {
+
+                public NonSelectButton() { SetStyle(ControlStyles.Selectable, false); TabStop = false; }
+
+            }
+
+
+
             static Button TitleBtn(string t)
 
             {
 
-                var b = new Button
+                var b = new NonSelectButton
 
                 {
 
@@ -748,6 +755,80 @@ namespace AppManager.Ui
             }
 
 
+
+            // ---------- self-drawn move / resize ----------
+            void BeginOp(Control src, int ht, Point cursor)
+            {
+                opHt = ht;
+                opCursor = cursor;
+                opWin = Location;
+                opSize = Size;
+                inNativeOp = true;
+                Opacity = 1.0;
+                opCap = src;
+                try { src.Capture = true; } catch { }
+            }
+
+            // dragging anywhere on the caption (the bar itself or its label)
+            // moves the window
+            void HookCaption(Control c)
+            {
+                c.MouseDown += (s, e) =>
+                {
+                    if (e.Button != MouseButtons.Left) return;
+                    BeginOp(c, 0, Cursor.Position);
+                };
+                c.MouseMove += (s, e) => { if (inNativeOp) FollowOp(); };
+                c.MouseUp += (s, e) => EndOp();
+            }
+
+            // 6px grab border on a child control: the docked panels cover the
+            // form's own client area, so the edge test runs in screen space
+            void HookGrip(Control c)
+            {
+                c.MouseDown += (s, e) =>
+                {
+                    if (e.Button != MouseButtons.Left) return;
+                    Point sp = c.PointToScreen(e.Location);
+                    int ht = HitCode(sp.X - Left, sp.Y - Top);
+                    if (ht == 0) return;
+                    BeginOp(c, ht, Cursor.Position);
+                };
+                c.MouseMove += (s, e) =>
+                {
+                    if (inNativeOp) { FollowOp(); return; }
+                    Point sp = c.PointToScreen(e.Location);
+                    Cursor = CursorFor(HitCode(sp.X - Left, sp.Y - Top));
+                };
+                c.MouseUp += (s, e) => EndOp();
+            }
+
+            void FollowOp()
+            {
+                Point cur = Cursor.Position;
+                int dx = cur.X - opCursor.X, dy = cur.Y - opCursor.Y;
+                if (opHt == 0) { Location = new Point(opWin.X + dx, opWin.Y + dy); return; }
+                bool left = opHt == 2 || opHt == 5 || opHt == 8;
+                bool right = opHt == 3 || opHt == 6 || opHt == 9;
+                bool top = opHt == 4 || opHt == 5 || opHt == 6;
+                bool bottom = opHt == 7 || opHt == 8 || opHt == 9;
+                int l = opWin.X, t = opWin.Y, w = opSize.Width, h = opSize.Height;
+                if (left) { l += dx; w -= dx; }
+                if (right) w += dx;
+                if (top) { t += dy; h -= dy; }
+                if (bottom) h += dy;
+                if (w < MinimumSize.Width) { if (left) l = opWin.X + opSize.Width - MinimumSize.Width; w = MinimumSize.Width; }
+                if (h < MinimumSize.Height) { if (top) t = opWin.Y + opSize.Height - MinimumSize.Height; h = MinimumSize.Height; }
+                Bounds = new Rectangle(l, t, w, h);
+            }
+
+            void EndOp()
+            {
+                if (!inNativeOp) return;
+                inNativeOp = false;
+                Opacity = OPACITY;
+                if (opCap != null) { try { opCap.Capture = false; } catch { } opCap = null; }
+            }
 
             // 0 = no grab zone; else HT code: 2=left 3=right 4=top 5=tl 6=tr 7=bottom 8=bl 9=br
             int HitCode(int x, int y)
@@ -1004,35 +1085,37 @@ namespace AppManager.Ui
 
                 {
 
+                    // restore exactly ONE window: the app's own main window.
+
+                    // Showing every top-level HWND of the process (renderer
+
+                    // hosts, tray/IME helpers, zero-sized message windows) is
+
+                    // what littered the screen with unrelated windows.
+
+                    IntPtr main = Core.FindMainWindow(it.processName, it.windowTitle);
+
                     int tries = 0;
 
-                    var wins = new List<IntPtr>();
-
-                    while (tries < 20 && wins.Count == 0)
+                    while (main == IntPtr.Zero && tries < 20)
 
                     {
 
                         Thread.Sleep(250);
 
-                        wins = Core.CollectWindows(it.processName, it.windowTitle);
+                        main = Core.FindMainWindow(it.processName, it.windowTitle);
 
                         tries++;
 
                     }
 
-                    foreach (var h in wins)
+                    if (main != IntPtr.Zero)
 
                     {
 
-                        P.ShowWindow(h, Core.SW_SHOW);
+                        P.ShowWindow(main, Core.SW_RESTORE);
 
-                        P.ShowWindow(h, 9 /*SW_RESTORE*/);
-
-                    }
-
-                    if (wins.Count > 0)
-
-                    {
+                        if (!P.IsWindowVisible(main)) P.ShowWindow(main, Core.SW_SHOW);
 
                         // bring the target app's window to the front. The
                         // picker holds the foreground for its whole life, so
@@ -1056,7 +1139,7 @@ namespace AppManager.Ui
 
                                 attached = AttachThreadInput(myTid, fgTid, true);
 
-                            P.SetForegroundWindow(wins[0]);
+                            P.SetForegroundWindow(main);
 
                             if (attached) AttachThreadInput(myTid, fgTid, false);
 

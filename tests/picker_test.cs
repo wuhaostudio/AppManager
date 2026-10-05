@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
@@ -74,6 +74,32 @@ static class PickerTest
             return true;
         }, IntPtr.Zero);
         return found;
+    }
+
+    // name of the SECOND app item in config.json (the new D2 target), or ""
+    // when it cannot be derived. Keeps D2 config-driven instead of hardcoding
+    // the machine's item names.
+    static string SecondAppName()
+    {
+        try
+        {
+            string cfg = File.ReadAllText(Path.Combine(
+                Environment.GetEnvironmentVariable("LOCALAPPDATA"), "AppManager", "config.json"));
+            var apps = new System.Collections.Generic.List<string>();
+            foreach (System.Text.RegularExpressions.Match m in
+                     System.Text.RegularExpressions.Regex.Matches(cfg, @"\{[^{}]*\}"))
+            {
+                string o = m.Value;
+                if (!o.Contains("\"name\"") || !o.Contains("\"exe\"")) continue;
+                var nm = System.Text.RegularExpressions.Regex.Match(o, "\"name\"\\s*:\\s*\"([^\"]*)\"");
+                if (!nm.Success) continue;
+                if (System.Text.RegularExpressions.Regex.IsMatch(o, "\"script\"\\s*:\\s*true")) continue;
+                apps.Add(nm.Groups[1].Value);
+            }
+            if (apps.Count >= 2) return apps[1];
+            return apps.Count == 1 ? apps[0] : "";
+        }
+        catch { return ""; }
     }
 
     // pid of the running engine; -1 when the pid file is missing, in which
@@ -309,14 +335,23 @@ static class PickerTest
             if (o1 && c1 && o2) Pass("D1", "hotkey toggles the picker (open/close/open)");
             else Fail("D1", "toggle failed: open1=" + o1 + " closed=" + c1 + " reopen=" + o2);
 
-            // D2: arrows + Enter opens the selected item and closes the picker
+            // D2: arrows + Enter opens the selected item and closes the picker.
+            // Two Downs from the initial selection (first app) must land on the
+            // SECOND app: while the ListBoxes were focusable the focused list
+            // also handled the arrow key natively, so every press advanced the
+            // selection twice and that row was skipped.
             if (o2)
             {
-                SendKey(0x28); SendKey(0x28); SendKey(0x0D); // Down x2 -> item 2, Enter
+                SendKey(0x28); SendKey(0x0D); // Down -> the second app, Enter opens it
                 bool gone = WaitPicker(false, 10000);
-                string tail = LogTail(6);
-                if (gone && tail.Contains("picker open")) Pass("D2", "Enter closed the picker and opened the selected item");
-                else Fail("D2", "after Enter: picker gone=" + gone + ", log tail: " + tail.Replace("\n", " | "));
+                string tail = LogTail(10);
+                string want = SecondAppName();
+                bool right = tail.Contains("opening '" + want + "'");
+                if (gone && want != "" && right)
+                    Pass("D2", "one Down landed on the second app; Enter opened '" + want + "' and closed the picker");
+                else if (gone && want == "" && tail.Contains("picker open"))
+                    Pass("D2", "Enter closed the picker and opened the selected item");
+                else Fail("D2", "after Enter: picker gone=" + gone + ", expected '" + want + "', log tail: " + tail.Replace("\n", " | "));
             }
 
             // D3: Esc closes a re-opened picker
@@ -336,13 +371,17 @@ static class PickerTest
             Hotkey();
             if (WaitPicker(true, 8000))
             {
-                SendKey(0x28); SendKey(0x28); // Down x2 -> last app
-                SendKey(0x28);                 // Down -> first script
-                string tail = LogTail(4);
+                SendKey(0x28);                 // Down 1 -> second app, exactly one step
+                string mid = LogTail(2);
+                SendKey(0x28);                 // Down 2 -> from the last app into the first script
+                string tail = LogTail(2);
                 SendKey(0x1B);
                 bool gone = WaitPicker(false, 5000);
-                if (tail.Contains("section scripts sel 0")) Pass("D4", "down-arrow crossed into the SCRIPTS section");
-                else Fail("D4", "no section-cross in log tail: " + tail.Replace("\n", " | ") + " pickerGone=" + gone);
+                bool stepped = mid.Contains("down -> sel 1");   // no skipped row
+                bool crossed = tail.Contains("section scripts sel 0");
+                if (stepped && crossed) Pass("D4", "two Downs stepped to the second app, the third crossed into the SCRIPTS section");
+                else Fail("D4", "stepped=" + stepped + " crossed=" + crossed +
+                    " | after 2 downs: " + mid.Replace("\n", " | ") + " | after 3rd: " + tail.Replace("\n", " | ") + " pickerGone=" + gone);
             }
             else Fail("D4", "picker did not open for the section-cross test");
         }

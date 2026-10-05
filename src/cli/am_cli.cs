@@ -358,7 +358,7 @@ namespace AppManager.Cli
                 }
                 else
                 {
-                    var wins = Core.CollectWindows(it.processName, it.windowTitle);
+                    var wins = Core.CollectAppWindows(it.processName, it.windowTitle);
                     int vis = 0, hid = 0;
                     foreach (var h in wins) { if (P.IsWindowVisible(h)) vis++; else hid++; }
                     string win = "(" + vis + "/" + hid + ")";

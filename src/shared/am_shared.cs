@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -158,6 +158,10 @@ namespace AppManager.Shared
         [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
         [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
         [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+        [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
+        [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int index);
+        [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+        [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
     }
 
     // ---------- script launchers: host interpreter + how to build the command line ----------
@@ -397,7 +401,7 @@ namespace AppManager.Shared
 
     public static class Core
     {
-        public const int SW_HIDE = 0, SW_SHOW = 5;
+        public const int SW_HIDE = 0, SW_SHOW = 5, SW_RESTORE = 9;
         public const string EngineProcName = "am-engine";
         public const string EngineExeName = "am-engine.exe";
         public const string MutexName = "AppManagerResident";
@@ -546,10 +550,66 @@ namespace AppManager.Shared
             return res;
         }
 
+        // Top-level windows that plausibly belong to the app's own UI.
+        // EnumWindows hands back *every* top-level HWND of the process, and a
+        // modern app (Chromium/Electron, IME, crash reporter, tray host) owns
+        // a pile of them: renderer hosts, zero-sized message windows, tool
+        // windows and owned popups. Restoring that whole set is what made the
+        // picker pop up unrelated windows/pages, so keep only "real" windows:
+        // unowned, non-tool, non-empty rectangles. Titled windows come first
+        // (helpers are usually titleless), each group in EnumWindows z-order.
+        public static List<IntPtr> CollectAppWindows(string proc, string title)
+        {
+            var titled = new List<IntPtr>();
+            var rest = new List<IntPtr>();
+            foreach (var h in CollectWindows(proc, title))
+            {
+                if (P.GetWindow(h, 4 /*GW_OWNER*/) != IntPtr.Zero) continue;      // owned = dialog/popup of another window
+                int ex = P.GetWindowLong(h, -20 /*GWL_EXSTYLE*/);
+                if ((ex & 0x80 /*WS_EX_TOOLWINDOW*/) != 0 && (ex & 0x40000 /*WS_EX_APPWINDOW*/) == 0) continue;
+                P.RECT r;
+                if (!P.GetWindowRect(h, out r)) continue;
+                if (r.Right - r.Left <= 0 || r.Bottom - r.Top <= 0) continue;     // message-only / zero-size helper
+                var sb = new StringBuilder(512);
+                P.GetWindowText(h, sb, sb.Capacity);
+                (sb.Length > 0 ? titled : rest).Add(h);
+            }
+            titled.AddRange(rest);
+            return titled;
+        }
+
+        // The single window the picker / `am show` should bring back: the
+        // largest titled app window (or, when nothing is titled, the largest
+        // app window). Ties keep the top-most in z-order.
+        public static IntPtr FindMainWindow(string proc, string title)
+        {
+            IntPtr bestTitled = IntPtr.Zero, bestAny = IntPtr.Zero;
+            long areaTitled = -1, areaAny = -1;
+            var name = new StringBuilder(512);
+            foreach (var h in CollectAppWindows(proc, title))
+            {
+                P.RECT r;
+                if (!P.GetWindowRect(h, out r)) continue;
+                long area = (long)(r.Right - r.Left) * (r.Bottom - r.Top);
+                if (area > areaAny) { areaAny = area; bestAny = h; }
+                name.Length = 0;
+                P.GetWindowText(h, name, name.Capacity);
+                if (name.Length > 0 && area > areaTitled) { areaTitled = area; bestTitled = h; }
+            }
+            // A titled window is the app's real UI; untitled ones are hidden
+            // helpers (Chromium's big offscreen render hosts) even when their
+            // rectangle is larger.
+            return bestTitled != IntPtr.Zero ? bestTitled : bestAny;
+        }
+
         public static int HideWindows(string proc, string title)
         {
             int n = 0;
-            foreach (var h in CollectWindows(proc, title))
+            // Only the app's real windows: minimizing every visible top-level
+            // HWND also hit the app's own helper windows (Chromium's power /
+            // tray / renderer hosts), which is how a "hide" could disturb the
+            // app's tray state instead of just putting its window away.
+            foreach (var h in CollectAppWindows(proc, title))
             {
                 if (!P.IsWindowVisible(h)) continue;
                 if (P.IsIconic(h))
@@ -573,12 +633,22 @@ namespace AppManager.Shared
             return n;
         }
 
+        // Bring an app back on screen: restore its main window only. Works
+        // for all three states a managed app can be in — minimized on the
+        // taskbar (iconic), hidden by its own "minimize to tray" handler
+        // (Chromium/Electron clients hide the window outright), or simply
+        // behind other windows.
         public static int ShowWindows(string proc, string title)
         {
-            int n = 0;
-            foreach (var h in CollectWindows(proc, title))
-                if (!P.IsWindowVisible(h) && P.ShowWindow(h, SW_SHOW)) n++;
-            return n;
+            IntPtr h = FindMainWindow(proc, title);
+            if (h == IntPtr.Zero) return 0;
+            P.ShowWindow(h, SW_RESTORE);
+            // SW_RESTORE does not always un-hide a window the app hid itself
+            // (ShowWindow(SW_HIDE) from its tray code never sets the iconic
+            // bit), so force a plain show as well.
+            if (!P.IsWindowVisible(h)) P.ShowWindow(h, SW_SHOW);
+            P.SetForegroundWindow(h);
+            return 1;
         }
 
                 // ---------- one pass: start-if-needed + continuous poll-hide for T seconds ----------
