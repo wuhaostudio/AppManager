@@ -1,53 +1,43 @@
-﻿using System;
-
+using System;
 using System.Collections.Generic;
-
 using System.Runtime.InteropServices;
-
-using System.Text;
-
 using System.Threading;
+using System.Windows.Forms;
+using System.Drawing;
 
 using AppManager.Shared;
 
 
-
 // AppManager picker UI module (built into am-engine.exe, /target:winexe, no console).
-
 //
-
-// The picker is a borderless-looking, transparent layered popup listing the
-
-// managed items: arrows move the selection, Enter opens the selected item's
-
-// app window, Esc closes. It is shown by the engine's hotkey watcher via
-
-// Picker.Show(); it is a top-level window module with no engine dependencies.
-
+// The picker is a dark, semi-transparent WinForms window listing the managed
+// items in two sections: APPS on top, SCRIPTS on the bottom (each section
+// gets a header row; an empty section is hidden). Shown by the engine's
+// hotkey watcher via Picker.Show(); pressing the hotkey again while open
+// closes it (toggle), Esc also closes.
 //
-
-// Rendering: the window is WS_EX_LAYERED and its pixels are a 32bpp alpha DIB
-
-// pushed with UpdateLayeredWindow. DefWindowProc paints the caption into the
-
-// window, so after any caption repaint we refresh the snapshot with a fresh
-
-// push (WM_EXITSIZEMOVE / a posted WM_PICKER_SYNC). Moving/resizing sends
-
-// WM_MOVING/WM_SIZING, which we answer with a push while they happen.
-
+// Look & feel (verified interactively with tests/window_probe.cs):
+//   - borderless dark window (Opacity 0.7 when idle), custom dark title bar
+//     with minimize / maximize / close buttons at the right edge
+//   - native move (drag the title bar) and native resize (drag edges/corners)
+//     via ReleaseCapture + WM_NCLBUTTONDOWN — the same system path as
+//     dragging a normal window, so no jitter; opacity goes to 1.0 while the
+//     native move/resize is in flight (DWM composites semi-transparent
+//     windows slowly while they move) and back to 0.7 on release
+//   - TOPMOST on open, released ~1.5s later (WinForms TopMost toggle, no
+//     window recreation needed) so ordinary apps can come forward normally
 //
-
-// Foreground: shown TOPMOST once at open, then TOPMOST is released ~1.5s
-
-// later so ordinary apps can come forward normally (click-to-activate).
-
-// Keyboard: global GetAsyncKeyState polling while the picker is open; the
-
-// hotkey itself keeps listening on the engine's hidden window, and pressing
-
-// it while open closes the picker (toggle).
-
+// Keyboard: global GetAsyncKeyState polling (works regardless of focus).
+// Up/Down/Left/Right move the selection, crossing section boundaries when a
+// list edge is reached (apps edge -> first script, scripts edge -> last
+// app); Enter opens the selected item's app window, Esc closes. The hotkey
+// itself (RegisterHotKey on the engine's hidden window) toggles the picker
+// open/closed.
+//
+// Threading: Picker.Show() does NOT block the caller. Each open picker runs
+// on its own background thread with its own WinForms message loop; the
+// engine's watcher thread keeps pumping so a second hotkey press (WM_HOTKEY
+// on the hidden window) re-enters Show() and closes the open picker.
 namespace AppManager.Ui
 
 {
@@ -56,206 +46,35 @@ namespace AppManager.Ui
 
     {
 
-        // ---------- Win32 ----------
-
-        [StructLayout(LayoutKind.Sequential)]
-
-        struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public int ptX; public int ptY; }
-
-
-
-        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-
-        struct WNDCLASSEX
-
-        {
-
-            public int cbSize; public int style; public IntPtr lpfnWndProc;
-
-            public int cbClsExtra; public int cbWndExtra;
-
-            public IntPtr hInstance; public IntPtr hIcon; public IntPtr hCursor;
-
-            public IntPtr hbrBackground; public string lpszMenuName;
-
-            public string lpszClassName; public IntPtr hIconSm;
-
-        }
-
-
-
-        [StructLayout(LayoutKind.Sequential)] public struct RECT { public int l, t, r, b; }
-
-        [StructLayout(LayoutKind.Sequential)] public struct POINT { public int x, y; }
-
-        [StructLayout(LayoutKind.Sequential)] public struct SIZE { public int cx, cy; }
-
-        [StructLayout(LayoutKind.Sequential)] public struct BLENDFUNCTION { public byte alpha, flags, color1, color2; }
-
-        [StructLayout(LayoutKind.Sequential)] struct BITMAPINFO
-
-        {
-
-            public int size, width, height;
-
-            public int planes, bitCount;
-
-            public int compression, imageSize, xPels, yPels;
-
-            public int colorsUsed, colorsImportant;
-
-            public int redMask, greenMask, blueMask, alphaMask; // 32bpp BI_MASKS
-
-        }
-
-
-
-        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-
-        static extern ushort RegisterClassExW(ref WNDCLASSEX wc);
-
-        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "CreateWindowExW")]
-
-        static extern IntPtr CreateWindowExW(int exStyle, string cls, string title, int style,
-
-            int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr inst, IntPtr p2);
-
-        [DllImport("user32.dll")] static extern bool DestroyWindow(IntPtr h);
-
-        [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
-
-        [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
-
-        [DllImport("user32.dll")] static extern IntPtr SetFocus(IntPtr h);
-
-        [DllImport("kernel32.dll")] static extern IntPtr GetModuleHandle(string n);
-
-        [DllImport("user32.dll")] static extern int PeekMessage(out MSG m, IntPtr h, uint min, uint max, uint rm);
-
-        [DllImport("user32.dll")] static extern int TranslateMessage(ref MSG m);
-
-        [DllImport("user32.dll")] static extern IntPtr DispatchMessage(ref MSG m);
-
         [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
 
-        [DllImport("user32.dll")] static extern int GetSystemMetrics(int i);
+        [DllImport("user32.dll")] static extern void ReleaseCapture();
 
-        [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr h, int idx, int val);
-        [DllImport("user32.dll", EntryPoint="SetWindowLongPtrW")] static extern long SetWindowLongPtr(IntPtr h, int idx, long val);
-
-        [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int idx);
-
-        [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr h, out RECT rc);
-        [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT rc);
-
-        [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr h, ref POINT p);
-
-        [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
+        [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
 
         [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
 
-        [DllImport("user32.dll")] static extern bool AttachThreadInput(uint idFrom, uint idTo, bool attach);
+        [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+
+        [DllImport("user32.dll")] static extern bool AttachThreadInput(uint idFrom, uint idTo, bool fAttach);
+
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
 
         [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
 
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int DrawTextW(IntPtr hdc, string s, int len, ref RECT rc, int fmt);
-
-        [DllImport("user32.dll")] static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, ref POINT pSrc,
-
-            ref SIZE sz, IntPtr hdcSrc, ref POINT pDst, uint crKey, ref BLENDFUNCTION blend, uint flags);
-
-        [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr hdc);
-
-        [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr hdc);
-
-        [DllImport("gdi32.dll")] static extern IntPtr CreateDIBSection(IntPtr hdc, ref BITMAPINFO bi,
-
-            int usage, out IntPtr data, IntPtr shared, int offset);
-
-        [DllImport("gdi32.dll")] static extern int SetBkColor(IntPtr hdc, int color);
-
-        [DllImport("gdi32.dll", CharSet = CharSet.Unicode)]
-
-        static extern IntPtr CreateFontW(int h, int w, int exp1, int exp2, int weight,
-
-            byte italic, byte underline, byte strikeout, int charset, int outType,
-
-            int clipType, int quality, int pitch, string face);
-
-        [DllImport("gdi32.dll")] static extern IntPtr GetStockObject(int i);
-
-        [DllImport("gdi32.dll")] static extern int DeleteObject(IntPtr o);
-
-        [DllImport("gdi32.dll")] static extern int SetTextColor(IntPtr hdc, int color);
-
-        [DllImport("gdi32.dll")] static extern int SetBkMode(IntPtr hdc, int mode);
-
-        [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr hdc, IntPtr o);
-
-        [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
-
-        [DllImport("kernel32.dll")] static extern IntPtr LoadLibrary(string n);
-
-        [DllImport("kernel32.dll", CharSet = CharSet.Ansi)] static extern IntPtr GetProcAddress(IntPtr m, string name);
+        const int WM_NCLBUTTONDOWN = 0xA1;
 
 
 
-        const int WS_POPUP = unchecked((int)0x80000000);
+        // one open picker at a time; toggle-Show closes it
+        static object gate = new object();
 
-        const int WS_CAPTION = 0x00C00000;
-
-        const int WS_THICKFRAME = 0x00040000;
-
-        const int WS_SYSMENU = 0x00080000;
-
-        const int WS_EX_LAYERED = 0x00080000;
-
-        const int WS_EX_TOPMOST = 0x00000008;
-
-        const int GWL_EXSTYLE = -20;
-
-        const uint SWP_SHOWWINDOW = 0x0040, SWP_NOACTIVATE = 0x0010;
-
-        const uint WM_HOTKEY = 0x0312;
-
-        const uint WM_ERASEBKGND = 0x0032;
-
-        const uint WM_ENTERSIZEMOVE = 0x0231, WM_EXITSIZEMOVE = 0x0232, WM_MOVING = 0x0234, WM_SIZING = 0x0233;
-
-        const uint WM_USER = 0x0400;
-
-        const uint WM_PICKER_SYNC = WM_USER + 1; // posted to self: re-push the layered bitmap
-
-        const uint WM_PICKER_RELEASE = WM_USER + 2; // posted to self: release topmost on the owning thread
+        static Form current;
 
 
 
-        const int ROW_H = 20;
-
-        const int PICKER_W = 520;
-
-
-
-        // ---------- offscreen layered-buffer state (one picker at a time) ----------
-
-        static IntPtr pickerDc;           // offscreen DC holding the bitmap
-
-        static IntPtr pickerBitmap;       // 32bpp BI_MASKS DIB section
-
-        static IntPtr pickerBitmapData;   // locked pointer to the DIB pixels
-
-        static int pickerW = 0, pickerH = 0;
-
-        static string pickerText = "";
-
-        static IntPtr pickerFont;
-
-        static int exTopmost;             // exstyle captured while TOPMOST
-
-
-
-        // ---------- public entry: open the picker on the calling thread ----------
-
+        // Open the picker, or toggle-close the one that is open. Non-blocking:
+        // returns immediately.
         public static void Show()
 
         {
@@ -268,121 +87,830 @@ namespace AppManager.Ui
 
 
 
-            int n = items.Count;
-
-            int headerH = 30;
-
-            int bodyH = Math.Max(n, 1) * ROW_H;
-
-            int H = headerH + bodyH + 8;
-
-
-
-            int screenW = GetSystemMetrics(0), screenH = GetSystemMetrics(1);
-
-            int x = Math.Max(0, (screenW - PICKER_W) / 2);
-
-            int y = Math.Max(0, (screenH - H) / 4);
-
-
-
-            var wc = new WNDCLASSEX();
-
-            wc.cbSize = Marshal.SizeOf(wc);
-
-            wc.lpfnWndProc = DefWindowProcAddress();
-
-            wc.hInstance = GetModuleHandle(null);
-
-            wc.hbrBackground = GetStockObject(4 /*BLACK_BRUSH*/);
-
-            wc.lpszClassName = "AMPicker" + Guid.NewGuid().ToString("N");
-
-            if (RegisterClassExW(ref wc) == 0) { Core.Log("picker: RegisterClassExW failed (" + Marshal.GetLastWin32Error() + ")"); return; }
-
-
-
-            // caption + thick frame => native drag/resize; the layered bitmap
-
-            // takes over the client area so it still looks like a dark popup.
-
-            IntPtr hwnd = CreateWindowExW(0, wc.lpszClassName, "AppManager",
-
-                WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU,
-
-                x, y, PICKER_W, H, IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
-
-            if (hwnd == IntPtr.Zero) { Core.Log("picker: create failed (" + Marshal.GetLastWin32Error() + ")"); return; }
-
-
-
-            // transparent layered: content is a 32bpp alpha bitmap pushed via
-
-            // UpdateLayeredWindow; the caption is painted by DefWindowProc and
-
-            // included in the snapshot.
-
-            exTopmost = GetWindowLong(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED | WS_EX_TOPMOST;
-
-            SetWindowLong(hwnd, GWL_EXSTYLE, exTopmost);
-
-
-
-            pickerFont = CreateFontW(0, 0, 0, 0, 400, 0, 0, 0, 131 /*ANSI*/, 0, 0, 4 /*CLEARTYPE_QUALITY*/, 1 /*DEFAULT_PITCH*/, "Consolas");
-
-            pickerText = "";
-
-
-
-            RepaintText(items, n, 0);
-
-            CreatePickerBuffer(PICKER_W, H);
-
-            PaintBitmap();
-
-            PushLayered(hwnd);
-
-
-
-            // open on top of every window, without stealing activation
-
-            SetWindowPos(hwnd, new IntPtr(-1), x, y, PICKER_W, H, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-
-            Core.Log("picker shown (" + n + " item(s))");
-
-
-
-            // keyboard focus: the picker is spawned from a background engine
-
-            // thread, so SetForegroundWindow can be refused — fall back to
-
-            // attaching the input thread of the current foreground window.
-
-            if (!SetForegroundWindow(hwnd))
+            lock (gate)
 
             {
 
-                IntPtr fg = GetForegroundWindow();
-
-                uint fgPid;
-
-                uint fgTid = P.GetWindowThreadProcessId(fg, out fgPid);
-
-                uint myTid = GetCurrentThreadId();
-
-                if (fgTid != 0 && fgTid != myTid)
+                if (current != null)
 
                 {
 
-                    if (AttachThreadInput(myTid, fgTid, true))
+                    var f = current;
+
+                    current = null;
+
+                    Core.Log("picker hotkey -> closing (toggle)");
+
+                    // close OUTSIDE the gate: FormClosed takes this same lock
+                    // (to clear `current`), so holding it while we wait on the
+                    // cross-thread Close() deadlocks watcher vs UI thread —
+                    // from which point every further hotkey press is dropped
+                    // and the picker handle leaks.
+                    try
 
                     {
 
-                        SetForegroundWindow(hwnd);
+                        if (f.IsHandleCreated) f.BeginInvoke(new MethodInvoker(f.Close));
 
-                        SetFocus(hwnd);
+                        else f.Close();
 
-                        AttachThreadInput(myTid, fgTid, false);
+                    }
+
+                    catch { try { f.Close(); } catch { } }
+
+                    return;
+
+                }
+
+                var form = new PickerForm(items);
+
+                current = form;
+
+                form.FormClosed += (s, e) =>
+
+                {
+
+                    Core.Log("picker closed");
+
+                    lock (gate) { if (current == form) current = null; }
+
+                };
+
+                form.Shown += (s, e) => Core.Log("picker shown (" + items.Count + " item(s))");
+
+                try
+
+                {
+
+                    new Thread(() =>
+
+                    {
+
+                        Application.Run(form);
+
+                        Core.Log("picker UI thread exited");
+
+                    }) { IsBackground = true, Name = "am-picker" }.Start();
+
+                }
+
+                catch (Exception ex)
+
+                {
+
+                    Core.Log("picker thread failed to start: " + ex.Message);
+
+                    current = null;
+
+                    form.Dispose();
+
+                }
+
+            }
+
+        }
+
+
+
+        // ---------- the picker window ----------
+        class PickerForm : Form
+
+        {
+
+            const int GRIP = 6;           // edge/corner grab zone for native resize
+            const double OPACITY = 0.7;   // idle semi-transparency
+            const int ROW_H = 26;
+            const int HDR_H = 18;         // section header height
+            const int BTN_H = 34;
+            const int BTN_W = 36;
+            const int BTN_IW = 32;
+            const int BTNY = 4;
+
+
+
+            readonly List<Item> appItems = new List<Item>();
+            readonly List<Item> scriptItems = new List<Item>();
+
+            int selA = 0, selS = 0;
+            bool inScripts;              // which section the selection lives in
+
+            List<string> appText = new List<string>();
+            List<string> scriptText = new List<string>();
+
+            Panel body;
+            Label hdrA, hdrS, status, title;
+            ListBox listA, listS;
+            Button minBtn, maxBtn, closeBtn;
+            bool inNativeOp;
+            bool syncing;               // guard: list handlers vs programmatic selects
+
+            System.Windows.Forms.Timer poller;
+            System.Windows.Forms.Timer stateTimer;
+            System.Windows.Forms.Timer grace;
+
+
+
+            public PickerForm(List<Item> items)
+
+            {
+
+                foreach (var it in items) (it.script ? scriptItems : appItems).Add(it);
+                inScripts = appItems.Count == 0;
+
+
+
+                int bodyH = 0;
+
+                if (appItems.Count > 0) bodyH += HDR_H + appItems.Count * ROW_H;
+
+                if (scriptItems.Count > 0) bodyH += HDR_H + scriptItems.Count * ROW_H;
+
+                int H = BTN_H + Math.Max(bodyH, 2 * ROW_H) + 30;
+
+                int W = 520;
+
+                int sw = Screen.PrimaryScreen.Bounds.Width, sh = Screen.PrimaryScreen.Bounds.Height;
+
+                Location = new Point(Math.Max(0, (sw - W) / 2), Math.Max(0, (sh - H) / 4));
+
+                Size = new Size(W, H);
+
+                MinimumSize = new Size(320, 140);
+
+                Text = "AppManager";
+
+                BackColor = Color.FromArgb(30, 30, 32);
+
+                Opacity = OPACITY;
+
+                FormBorderStyle = FormBorderStyle.None;
+
+                StartPosition = FormStartPosition.Manual;
+
+                TopMost = true;
+
+                ShowInTaskbar = true;
+
+                AutoScaleMode = AutoScaleMode.None;
+
+
+
+                // ---- custom dark title bar ----
+                var tb = new Panel { BackColor = Color.FromArgb(24, 24, 28), Dock = DockStyle.Top, Height = BTN_H };
+
+                title = new Label
+
+                {
+
+                    Text = "AppManager    Up/Down select    Enter open    Esc close",
+
+                    ForeColor = Color.FromArgb(220, 220, 220),
+
+                    BackColor = Color.Transparent,
+
+                    Font = new Font("Segoe UI", 10f, FontStyle.Bold),
+
+                    AutoSize = false,
+
+                    TextAlign = ContentAlignment.MiddleLeft,
+
+                    Location = new Point(8, 4),
+
+                };
+
+                minBtn = TitleBtn("—");
+
+                maxBtn = TitleBtn("□");
+
+                closeBtn = TitleBtn("×");
+
+                closeBtn.Click += (s, e) => Close();
+
+                minBtn.Click += (s, e) => WindowState = FormWindowState.Minimized;
+
+                maxBtn.Click += (s, e) => WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized;
+
+                tb.Controls.Add(title);
+
+                tb.Controls.Add(minBtn);
+
+                tb.Controls.Add(maxBtn);
+
+                tb.Controls.Add(closeBtn);
+
+                PositionButtons();
+
+
+
+                // ---- two-section body: APPS on top, SCRIPTS below ----
+                body = new Panel { BackColor = BackColor, Dock = DockStyle.Fill };
+
+                if (appItems.Count > 0)
+
+                {
+
+                    hdrA = SectionHeader("APPS");
+
+                    listA = NewList();
+
+                    FillList(listA, appItems, appText);
+
+                    body.Controls.Add(hdrA);
+
+                    body.Controls.Add(listA);
+
+                }
+
+                if (scriptItems.Count > 0)
+
+                {
+
+                    hdrS = SectionHeader("SCRIPTS");
+
+                    listS = NewList();
+
+                    FillList(listS, scriptItems, scriptText);
+
+                    body.Controls.Add(hdrS);
+
+                    body.Controls.Add(listS);
+
+                }
+
+                status = new Label
+
+                {
+
+                    ForeColor = Color.FromArgb(255, 200, 80),
+
+                    BackColor = Color.FromArgb(30, 30, 32),
+
+                    Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+
+                    Dock = DockStyle.Bottom,
+
+                    Height = 30,
+
+                    TextAlign = ContentAlignment.MiddleLeft,
+
+                };
+
+                Controls.Add(status);
+
+                Controls.Add(body);
+
+                Controls.Add(tb);
+
+                body.BringToFront();
+
+                status.BringToFront();
+
+                LayoutBody();
+
+                body.SizeChanged += (s, e) => LayoutBody();
+
+
+
+                // initial selection + status
+                if (!inScripts && appItems.Count > 0) SelectApp(0);
+                else if (scriptItems.Count > 0) SelectScript(0);
+
+
+
+                // ---- native move: drag the title bar (system handles it, no jitter) ----
+                tb.MouseDown += (s, e) =>
+
+                {
+
+                    if (e.Button != MouseButtons.Left) return;
+
+                    inNativeOp = true;
+
+                    Opacity = 1.0;
+
+                    ReleaseCapture();
+
+                    SendMessage(Handle, WM_NCLBUTTONDOWN, new IntPtr(2 /*HTCAPTION*/), IntPtr.Zero);
+
+                };
+
+                tb.MouseUp += (s, e) => { if (inNativeOp) { inNativeOp = false; Opacity = OPACITY; } };
+
+
+
+                // ---- native resize: 4 edges + 4 corners ----
+                MouseDown += (s, e) =>
+
+                {
+
+                    if (e.Button != MouseButtons.Left) return;
+
+                    int ht = HitCode(e.X, e.Y);
+
+                    if (ht == 0) return;
+
+                    inNativeOp = true;
+
+                    Opacity = 1.0;
+
+                    ReleaseCapture();
+
+                    SendMessage(Handle, WM_NCLBUTTONDOWN, new IntPtr(ht), IntPtr.Zero);
+
+                };
+
+                MouseUp += (s, e) => { if (inNativeOp) { inNativeOp = false; Opacity = OPACITY; } };
+
+                MouseMove += (s, e) => { if (!inNativeOp) Cursor = CursorFor(HitCode(e.X, e.Y)); };
+
+
+
+                // ---- focus: steal it for this picker's lifetime so that
+                //   (a) native key events (arrows in a focused listbox) land
+                //        here instead of the app that had the keyboard;
+                //   (b) the picker's own GetAsyncKeyState polls see a
+                //        consistent foreground for its toggle.
+                // The hotkey fired globally, so we have no input of our own:
+                // attach to the current foreground thread to be allowed to
+                // activate.
+                Shown += (s, e) =>
+                {
+                    try
+                    {
+                        IntPtr fg = GetForegroundWindow();
+                        uint fgPid;
+                        uint fgTid = GetWindowThreadProcessId(fg, out fgPid);
+                        uint myTid = GetCurrentThreadId();
+                        bool attached = false;
+                        if (fgTid != 0 && fgTid != myTid)
+                            attached = AttachThreadInput(myTid, fgTid, true);
+                        SetForegroundWindow(this.Handle);
+                        if (attached) AttachThreadInput(myTid, fgTid, false);
+                    }
+                    catch { }
+                };
+
+
+                // ---- release topmost ~1.5s after open: the picker becomes a
+
+                // normal window ordinary apps can cover ----
+                grace = new System.Windows.Forms.Timer { Interval = 1500 };
+
+                grace.Tick += (s, e) =>
+
+                {
+
+                    grace.Stop();
+
+                    TopMost = false;
+
+                    Core.Log("picker: topmost released");
+
+                };
+
+                grace.Start();
+
+
+
+                // ---- refresh running/stopped state once a second ----
+                stateTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+
+                stateTimer.Tick += (s, e) => RefreshStates();
+
+                stateTimer.Start();
+
+
+
+                // ---- keyboard: global polling (works with or without focus) ----
+                int[] watch = { 0x1B, 0x0D, 0x26, 0x28, 0x25, 0x27 }; // Esc Enter Up Down Left Right
+                short[] prev = new short[watch.Length];
+
+                for (int i = 0; i < watch.Length; i++) prev[i] = GetAsyncKeyState(watch[i]);
+
+                poller = new System.Windows.Forms.Timer { Interval = 30 };
+
+                poller.Tick += (s, e) => Poll(watch, prev);
+
+                poller.Start();
+
+            }
+
+
+
+            Label SectionHeader(string t)
+
+            {
+
+                return new Label
+
+                {
+
+                    Text = "  " + t,
+
+                    ForeColor = Color.FromArgb(120, 160, 220),
+
+                    BackColor = Color.FromArgb(34, 34, 40),
+
+                    Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+
+                    AutoSize = false,
+
+                };
+
+            }
+
+
+
+            ListBox NewList()
+
+            {
+
+                var lb = new ListBox
+
+                {
+
+                    BackColor = Color.FromArgb(38, 38, 42),
+
+                    ForeColor = Color.White,
+
+                    BorderStyle = BorderStyle.None,
+
+                    Font = new Font("Consolas", 12f, FontStyle.Regular),
+
+                    ItemHeight = ROW_H,
+
+                };
+
+                lb.DoubleClick += (s, e) => OpenSelected();
+
+                lb.SelectedIndexChanged += (s, e) =>
+
+                {
+
+                    if (syncing || lb.SelectedIndex < 0) return;
+
+                    // mouse click in one list moves the selection there
+                    if (lb == listA) { selA = lb.SelectedIndex; inScripts = false; UpdateStatus(); }
+                    else { selS = lb.SelectedIndex; inScripts = true; UpdateStatus(); }
+
+                };
+
+                return lb;
+
+            }
+
+
+
+            void FillList(ListBox lb, List<Item> its, List<string> textOut)
+
+            {
+
+                for (int i = 0; i < its.Count; i++)
+
+                {
+
+                    string t = RowText(its[i]);
+
+                    textOut.Add(t);
+
+                    lb.Items.Add(t);
+
+                }
+
+            }
+
+
+
+            // stack the visible sections vertically; leftover vertical space
+
+            // below stays empty (rows are fixed-height)
+            void LayoutBody()
+
+            {
+
+                int w = body.ClientSize.Width;
+
+                int y = 0;
+
+                if (listA != null)
+
+                {
+
+                    hdrA.Location = new Point(0, y);
+
+                    hdrA.Size = new Size(w, HDR_H);
+
+                    y += HDR_H;
+
+                    listA.Location = new Point(0, y);
+
+                    listA.Size = new Size(w, appItems.Count * ROW_H);
+
+                    y += listA.Height;
+
+                }
+
+                if (listS != null)
+
+                {
+
+                    hdrS.Location = new Point(0, y);
+
+                    hdrS.Size = new Size(w, HDR_H);
+
+                    y += HDR_H;
+
+                    listS.Location = new Point(0, y);
+
+                    listS.Size = new Size(w, scriptItems.Count * ROW_H);
+
+                }
+
+            }
+
+
+
+            Item SelectedItem()
+
+            {
+
+                if (inScripts) return scriptItems.Count > 0 ? scriptItems[selS] : null;
+
+                return appItems.Count > 0 ? appItems[selA] : null;
+
+            }
+
+
+
+            void SelectApp(int i)
+
+            {
+
+                syncing = true;
+
+                selA = i;
+
+                inScripts = false;
+
+                if (listA != null) listA.SelectedIndex = i;
+
+                if (listS != null) listS.SelectedIndex = -1;
+
+                syncing = false;
+
+                UpdateStatus();
+
+            }
+
+
+
+            void SelectScript(int i)
+
+            {
+
+                syncing = true;
+
+                selS = i;
+
+                inScripts = true;
+
+                if (listS != null) listS.SelectedIndex = i;
+
+                if (listA != null) listA.SelectedIndex = -1;
+
+                syncing = false;
+
+                UpdateStatus();
+
+            }
+
+
+
+            void UpdateStatus()
+
+            {
+
+                var it = SelectedItem();
+
+                status.Text = "Selected: " + (it != null ? it.name : "(no enabled items - add one with 'am add')");
+
+            }
+
+
+
+            void PositionButtons()
+
+            {
+
+                int w = ClientSize.Width;
+
+                minBtn.Location = new Point(w - 3 * BTN_W, BTNY);
+
+                maxBtn.Location = new Point(w - 2 * BTN_W, BTNY);
+
+                closeBtn.Location = new Point(w - BTN_W, BTNY);
+
+                maxBtn.Text = WindowState == FormWindowState.Maximized ? "❐" : "□";
+
+                // keep the hint text from running into the caption buttons
+                title.Width = Math.Max(60, w - 8 - 3 * BTN_W - 4);
+
+            }
+
+
+
+            static Button TitleBtn(string t)
+
+            {
+
+                var b = new Button
+
+                {
+
+                    Text = t,
+
+                    ForeColor = Color.FromArgb(220, 220, 220),
+
+                    BackColor = Color.FromArgb(48, 48, 52),
+
+                    FlatStyle = FlatStyle.Flat,
+
+                    Font = new Font("Segoe UI", 11f, FontStyle.Bold),
+
+                    Size = new Size(BTN_IW, 24),
+
+                };
+
+                b.FlatAppearance.BorderSize = 0;
+
+                return b;
+
+            }
+
+
+
+            // 0 = no grab zone; else HT code: 2=left 3=right 4=top 5=tl 6=tr 7=bottom 8=bl 9=br
+            int HitCode(int x, int y)
+
+            {
+
+                bool l = x <= GRIP, r = x >= Width - GRIP;
+
+                bool t = y <= GRIP, b = y >= Height - GRIP;
+
+                if (t && l) return 5; if (t && r) return 6;
+
+                if (b && l) return 8; if (b && r) return 9;
+
+                if (l) return 2; if (r) return 3;
+
+                if (t) return 4; if (b) return 7;
+
+                return 0;
+
+            }
+
+
+
+            static Cursor CursorFor(int ht)
+
+            {
+
+                switch (ht)
+
+                {
+
+                    case 2: case 3: return Cursors.SizeWE;
+
+                    case 4: case 7: return Cursors.SizeNS;
+
+                    case 5: case 9: return Cursors.SizeNWSE;
+
+                    case 6: case 8: return Cursors.SizeNESW;
+
+                    default: return Cursors.Default;
+
+                }
+
+            }
+
+
+
+            string RowText(Item it)
+
+            {
+
+                string state = Core.ProcCount(it.processName) > 0 ? "running" : "stopped";
+
+                return PadR(it.name, 24) + " " + state;
+
+            }
+
+
+
+            static string PadR(string s, int w)
+
+            {
+
+                s = s ?? "";
+
+                if (s.Length > w) s = s.Substring(0, w - 1) + ".";
+
+                while (s.Length < w) s += " ";
+
+                return s;
+
+            }
+
+
+
+            void RefreshStates()
+
+            {
+
+                UpdateListTexts(listA, appItems, appText);
+
+                UpdateListTexts(listS, scriptItems, scriptText);
+
+            }
+
+
+
+            void UpdateListTexts(ListBox lb, List<Item> its, List<string> textOut)
+
+            {
+
+                if (lb == null) return;
+
+                for (int i = 0; i < its.Count; i++)
+
+                {
+
+                    string t = RowText(its[i]);
+
+                    if (t == textOut[i]) continue;
+
+                    textOut[i] = t;
+
+                    if (lb.SelectedIndex != i) lb.Items[i] = t;
+
+                }
+
+            }
+
+
+
+            // cross-section navigation: at a list edge the direction key jumps
+
+            // into the neighbouring section (down from the last app -> first
+            // script; up from the first script -> last app); empty sections
+
+            // are skipped
+            void MoveSel(int dir)
+
+            {
+
+                if (dir > 0)
+
+                {
+
+                    if (!inScripts)
+
+                    {
+
+                        if (selA < appItems.Count - 1) { SelectApp(selA + 1); Core.Log("picker key down -> sel " + selA); }
+                        else if (scriptItems.Count > 0) { SelectScript(0); Core.Log("picker key down -> section scripts sel 0"); }
+
+                    }
+
+                    else
+
+                    {
+
+                        if (selS < scriptItems.Count - 1) { SelectScript(selS + 1); Core.Log("picker key down -> scripts sel " + selS); }
+
+                    }
+
+                }
+
+                else
+
+                {
+
+                    if (inScripts)
+
+                    {
+
+                        if (selS > 0) { SelectScript(selS - 1); Core.Log("picker key up -> scripts sel " + selS); }
+                        else if (appItems.Count > 0) { SelectApp(appItems.Count - 1); Core.Log("picker key up -> section apps sel " + selA); }
+
+                    }
+
+                    else
+
+                    {
+
+                        if (selA > 0) { SelectApp(selA - 1); Core.Log("picker key up -> sel " + selA); }
 
                     }
 
@@ -392,130 +920,9 @@ namespace AppManager.Ui
 
 
 
-            // release topmost ~1.5s after opening: the picker stays a normal
-
-            // window the user can cover by activating other apps.
-
-            // release topmost ~1.5s after opening, ON THE WINDOW'S OWNING
-
-            // THREAD (the input pump below). Applied from a background thread
-
-            // the release does not stick, so post it to the owning thread.
-
-            Thread grace = new Thread(() =>
+            void Poll(int[] watch, short[] prev)
 
             {
-
-                Thread.Sleep(1500);
-
-                if (!IsWindow(hwnd)) return;
-
-                bool posted = PostMessage(hwnd, WM_PICKER_RELEASE, IntPtr.Zero, IntPtr.Zero);
-
-                Core.Log("picker: topmost release posted=" + posted);
-
-            }) { IsBackground = true, Name = "am-topmost-grace" };
-
-            try { grace.Start(); } catch (Exception ex) { Core.Log("picker grace thread: " + ex.Message); }
-
-
-
-            // input: global GetAsyncKeyState polling (works regardless of focus)
-
-            int[] watch = new int[] { 0x1B, 0x0D, 0x26, 0x28, 0x25, 0x27 }; // Esc Enter Up Down Left Right
-
-            for (int i = 0; i < watch.Length; i++) GetAsyncKeyState(watch[i]);
-
-
-
-            int sel = 0;
-
-            int lastSel = -1;
-
-            bool open = true;
-
-            // deterministic up->down edge detection: the OS transition bit of
-
-            // GetAsyncKeyState (0x4000) is unreliable (key taps shorter than a
-
-            // poll interval clear it), so we track each key's previous state.
-
-            short[] prev = new short[watch.Length];
-
-            for (int i = 0; i < watch.Length; i++) prev[i] = GetAsyncKeyState(watch[i]);
-
-            while (open)
-
-            {
-
-                // pump our own messages so move/resize stay live. Painting is
-
-                // the layered bitmap, never BeginPaint (DefWindowProc owns the
-
-                // caption; we snapshot it instead).
-
-                MSG pm;
-
-                bool skipDispatch;
-
-                while (PeekMessage(out pm, IntPtr.Zero, 0, 0, 0x0001 /*PM_REMOVE*/) != 0)
-
-                {
-
-                    skipDispatch = false;
-
-                    if (pm.message == WM_HOTKEY && IsWindow(hwnd)) { open = false; } // hotkey toggles the picker closed
-
-                    else if (pm.message == WM_ERASEBKGND && pm.hwnd == hwnd) { skipDispatch = true; }
-
-                    else if ((pm.message == WM_MOVING || pm.message == WM_SIZING) && pm.hwnd == hwnd)
-
-                    { skipDispatch = true; if (PaintBitmap() == 0) PushLayered(hwnd); }
-
-                    else if (pm.message == WM_ENTERSIZEMOVE && pm.hwnd == hwnd)
-
-                    { skipDispatch = true; }
-
-                    else if (pm.message == WM_EXITSIZEMOVE && pm.hwnd == hwnd)
-
-                    { skipDispatch = true; PushLayered(hwnd); }
-
-                    else if (pm.message == WM_PICKER_SYNC && pm.hwnd == hwnd) { skipDispatch = true; }
-
-                    else if (pm.message == WM_PICKER_RELEASE && pm.hwnd == hwnd)
-                    {
-                        skipDispatch = true;
-                        // this OS only honors the TOPMOST tier from the
-                        // exstyle supplied at window CREATION; clearing the
-                        // flag or SetWindowPos(HWND_NOTOPMOST) afterwards does
-                        // not demote it. Release = destroy + recreate the
-                        // window WITHOUT TOPMOST at the same rect.
-                        RECT fr;
-                        GetWindowRect(hwnd, out fr);
-                        int fx = fr.l, fy = fr.t, fw = fr.r - fr.l, fh = fr.b - fr.t;
-                        DestroyWindow(hwnd);
-                        hwnd = CreateWindowExW(WS_EX_LAYERED, wc.lpszClassName, "AppManager",
-                            WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU,
-                            fx, fy, fw, fh, IntPtr.Zero, IntPtr.Zero, wc.hInstance, IntPtr.Zero);
-                        if (hwnd != IntPtr.Zero)
-                        {
-                            P.ShowWindow(hwnd, 5 /*SW_SHOW*/);
-                            // redraw the content into the fresh snapshot
-                            RepaintText(items, n, sel);
-                            CreatePickerBuffer(fw, fh);
-                            PaintBitmap();
-                            PushLayered(hwnd);
-                        }
-                        Core.Log("picker: topmost released (window recreated without TOPMOST, hwnd=0x" + hwnd.ToString("X") + ")");
-                    }
-
-                    if (skipDispatch) continue;
-
-                    TranslateMessage(ref pm);
-
-                    DispatchMessage(ref pm);
-
-                }
 
                 for (int i = 0; i < watch.Length; i++)
 
@@ -529,385 +936,178 @@ namespace AppManager.Ui
 
                     prev[i] = cur;
 
-                    // our own up->down edge (reliable); the OS 0x4000 transition
+                    // our own up->down edge (the OS 0x4000 transition bit is
 
-                    // bit is missed when a key tap lasts < poll interval
+                    // missed when a key tap lasts less than the poll interval)
 
-                    if (downNow && !wasDown)
+                    if (!(downNow && !wasDown)) continue;
+
+                    switch (watch[i])
 
                     {
 
-                        switch (watch[i])
+                        case 0x26: // Up
+                        case 0x25: // Left
+                            MoveSel(-1);
+                            break;
 
-                        {
+                        case 0x28: // Down
+                        case 0x27: // Right
+                            MoveSel(+1);
+                            break;
 
-                            case 0x26: // Up
+                        case 0x0D: // Enter -> open the selected item
+                            if (SelectedItem() != null)
 
-                            case 0x25: // Left
+                            {
 
-                                if (n > 0) sel = (sel - 1 + n) % n;
+                                Core.Log("picker key enter -> opening '" + SelectedItem().name + "'");
 
-                                Core.Log("picker key up/left -> sel " + sel);
+                                OpenSelected();
 
-                                break;
+                            }
 
-                            case 0x28: // Down
+                            break;
 
-                            case 0x27: // Right
-
-                                if (n > 0) sel = (sel + 1) % n;
-
-                                Core.Log("picker key down/right -> sel " + sel);
-
-                                break;
-
-                            case 0x0D: // Enter -> open the selected item
-
-                                Core.Log("picker key enter -> opening item " + Math.Min(sel, n - 1));
-
-                                if (n > 0) OpenItem(items[sel]);
-
-                                open = false;
-
-                                break;
-
-                            case 0x1B: // Esc -> close
-
-                                Core.Log("picker key esc -> closing");
-
-                                open = false;
-
-                                break;
-
-                        }
+                        case 0x1B: // Esc -> close
+                            Core.Log("picker key esc -> closing");
+                            Close();
+                            break;
 
                     }
 
                 }
 
-                if (open && sel != lastSel)
+            }
+
+
+
+            // open the selected item: start it if not running, then restore /
+            // foreground its windows (plain apps); scripts are launch-only.
+            void OpenSelected()
+
+            {
+
+                var it = SelectedItem();
+
+                if (it == null) { Close(); return; }
+
+                Core.Log("picker open '" + it.name + "'");
+
+                bool started = false;
+
+                if (Core.ProcCount(it.processName) == 0) started = Core.StartApp(it);
+
+
+
+                if (!it.script)
 
                 {
 
-                    RepaintText(items, n, sel);
+                    int tries = 0;
 
-                    if (PaintBitmap() == 0) PushLayered(hwnd);
+                    var wins = new List<IntPtr>();
 
-                    lastSel = sel;
+                    while (tries < 20 && wins.Count == 0)
+
+                    {
+
+                        Thread.Sleep(250);
+
+                        wins = Core.CollectWindows(it.processName, it.windowTitle);
+
+                        tries++;
+
+                    }
+
+                    foreach (var h in wins)
+
+                    {
+
+                        P.ShowWindow(h, Core.SW_SHOW);
+
+                        P.ShowWindow(h, 9 /*SW_RESTORE*/);
+
+                    }
+
+                    if (wins.Count > 0)
+
+                    {
+
+                        // bring the target app's window to the front. The
+                        // picker holds the foreground for its whole life, so
+                        // SetForegroundWindow needs the attach-to-foreground
+                        // thread dance (the picker's Shown handler uses it too).
+                        try
+
+                        {
+
+                            IntPtr fg = GetForegroundWindow();
+
+                            uint fgPid;
+
+                            uint fgTid = GetWindowThreadProcessId(fg, out fgPid);
+
+                            uint myTid = GetCurrentThreadId();
+
+                            bool attached = false;
+
+                            if (fgTid != 0 && fgTid != myTid)
+
+                                attached = AttachThreadInput(myTid, fgTid, true);
+
+                            P.SetForegroundWindow(wins[0]);
+
+                            if (attached) AttachThreadInput(myTid, fgTid, false);
+
+                        }
+
+                        catch { }
+
+                    }
+
+                    else if (started)
+
+                        Core.Log("picker: no window found for '" + it.name + "' after start (background app?)");
 
                 }
 
-                Thread.Sleep(25);
+                Core.Log("picker: '" + it.name + "' " + (started ? "started" : "already running") +
+
+                    (it.script ? " (script, launch-only)" : " window(s) shown"));
+
+                Close();
 
             }
 
 
 
-            DestroyWindow(hwnd);
-
-            DeleteObject(pickerFont);
-
-            pickerFont = IntPtr.Zero;
-
-            pickerText = "";
-
-            Core.Log("picker closed");
-
-        }
-
-
-
-        // ---------- layered-buffer plumbing ----------
-
-        static void CreatePickerBuffer(int w, int h)
-
-        {
-
-            if (pickerDc != IntPtr.Zero)
+            protected override void OnFormClosed(FormClosedEventArgs e)
 
             {
 
-                DeleteObject(pickerBitmap);
+                try { if (poller != null) poller.Stop(); } catch { }
 
-                DeleteDC(pickerDc);
+                try { if (stateTimer != null) stateTimer.Stop(); } catch { }
 
-            }
+                try { if (grace != null) grace.Stop(); } catch { }
 
-            pickerBitmap = IntPtr.Zero;
+                base.OnFormClosed(e);
 
-            pickerBitmapData = IntPtr.Zero;
-
-            pickerW = w; pickerH = h;
-
-            pickerDc = CreateCompatibleDC(IntPtr.Zero);
-
-            if (pickerDc == IntPtr.Zero) return;
-
-            var bi = new BITMAPINFO();
-
-            bi.size = Marshal.SizeOf(typeof(BITMAPINFO));
-
-            bi.width = w; bi.height = -h;      // top-down
-
-            bi.planes = 1; bi.bitCount = 32;
-
-            bi.compression = 11;               // BI_MASKS
-
-            bi.redMask = 0x00FF0000; bi.greenMask = 0x0000FF00;
-
-            bi.blueMask = 0x000000FF; bi.alphaMask = unchecked((int)0xFF000000);
-
-            IntPtr data;
-
-            pickerBitmap = CreateDIBSection(pickerDc, ref bi, 0, out data, IntPtr.Zero, 0);
-
-            if (pickerBitmap == IntPtr.Zero) { pickerDc = IntPtr.Zero; return; }
-
-            pickerBitmapData = data;
-
-            IntPtr old = SelectObject(pickerDc, pickerBitmap);
-
-            if (old != IntPtr.Zero) DeleteObject(old);
-
-        }
-
-
-
-        // paint text into the DIB: opaque black base + white Consolas lines
-
-        static int PaintBitmap()
-
-        {
-
-            if (pickerBitmap == IntPtr.Zero || pickerBitmapData == IntPtr.Zero || pickerW <= 0) return 1;
-
-            for (int i = 0; i < pickerW * pickerH; i++)
-
-                Marshal.WriteInt32(pickerBitmapData, i * 4, unchecked((int)0xFF000000));
-
-            if (pickerText.Length > 0)
-
-            {
-
-                SetBkColor(pickerDc, unchecked((int)0xFF000000));
-
-                SetTextColor(pickerDc, 0x00FFFFFF); // white (0x00BBGGRR)
-
-                SetBkMode(pickerDc, 0);              // OPAQUE; alpha is per-pixel in the DIB
-
-                IntPtr oldFont = pickerFont != IntPtr.Zero ? SelectObject(pickerDc, pickerFont) : IntPtr.Zero;
-
-                RECT full = new RECT { l = 0, t = 0, r = pickerW, b = pickerH };
-
-                DrawTextW(pickerDc, pickerText, -1, ref full, 0x03 /*DT_LEFT|DT_TOP*/);
-
-                if (oldFont != IntPtr.Zero) SelectObject(pickerDc, oldFont);
+                // destroy the window handle even when the close came from a
+                // foreign thread (hotkey toggle closes us from the engine's
+                // watcher thread): without this the HWND stays alive and the
+                // UI thread's message loop keeps pumping, so observers see a
+                // "closed" picker window that is actually still open.
+                // DestroyHandle() from the form itself is what the handle
+                // lifetime probe (tests/handle_probe.cs) verified to release
+                // the HWND; ExitThread posted from a foreign thread did NOT.
+                try { DestroyHandle(); } catch { }
 
             }
-
-            return 0;
-
-        }
-
-
-
-        static bool PushLayered(IntPtr hwnd)
-
-        {
-
-            if (pickerBitmap == IntPtr.Zero) return false;
-
-            RECT rc;
-
-            GetClientRect(hwnd, out rc);
-
-            POINT src = new POINT { x = 0, y = 0 };
-
-            SIZE sz = new SIZE { cx = rc.r, cy = rc.b };
-
-            POINT dst = new POINT();
-
-            ClientToScreen(hwnd, ref dst);
-
-            BLENDFUNCTION bf = new BLENDFUNCTION { flags = 0 /*AC_SRC_ALPHA*/, alpha = 0xFF, color1 = 0 };
-
-            bool ok = UpdateLayeredWindow(hwnd, IntPtr.Zero, ref src, ref sz,
-
-                IntPtr.Zero, ref dst, 0, ref bf, 0x0002 /*ULW_OPAQUE*/);
-
-            // the window moved/resized: rebuild the snapshot to match, then repaint
-
-            if (rc.r != pickerW || rc.b != pickerH)
-
-            {
-
-                CreatePickerBuffer(rc.r, rc.b);
-
-                PaintBitmap();
-
-            }
-
-            return ok;
-
-        }
-
-
-
-        // ---------- content ----------
-
-        static void RepaintText(List<Item> items, int n, int sel)
-
-        {
-
-            var sb = new StringBuilder();
-
-            sb.Append(" AppManager");
-
-            if (n > 0) sb.Append("    [Up/Down/Left/Right] move   [Enter] open   [Esc] close");
-
-            else sb.Append("    [Esc] close");
-
-            sb.Append('\n');
-
-            if (n == 0)
-
-            {
-
-                sb.Append(" (no enabled items - add one with 'am add')");
-
-            }
-
-            else
-
-            {
-
-                for (int i = 0; i < n; i++)
-
-                {
-
-                    var it = items[i];
-
-                    int pc = Core.ProcCount(it.processName);
-
-                    string state = pc > 0 ? "running" : "stopped";
-
-                    string mark = i == sel ? ">>>" : "   ";
-
-                    sb.Append(mark).Append(' ');
-
-                    sb.Append(PadR(it.name, 24)).Append(' ');
-
-                    sb.Append(PadR(it.script ? "script" : "app", 7)).Append(' ');
-
-                    sb.Append(state);
-
-                    if (i < n - 1) sb.Append('\n');
-
-                }
-
-            }
-
-            pickerText = sb.ToString();
-
-        }
-
-
-
-        static string PadR(string s, int w)
-
-        {
-
-            s = s ?? "";
-
-            if (s.Length > w) s = s.Substring(0, w - 1) + ".";
-
-            while (s.Length < w) s += " ";
-
-            return s;
-
-        }
-
-
-
-        // open the selected item: start it if not running, then restore/
-
-        // foreground its windows (plain apps); scripts are launch-only.
-
-        static void OpenItem(Item it)
-
-        {
-
-            Core.Log("picker open '" + it.name + "'");
-
-            bool started = false;
-
-            if (Core.ProcCount(it.processName) == 0)
-
-                started = Core.StartApp(it);
-
-
-
-            if (!it.script)
-
-            {
-
-                int tries = 0;
-
-                var wins = new List<IntPtr>();
-
-                while (tries < 20 && wins.Count == 0)
-
-                {
-
-                    Thread.Sleep(250);
-
-                    wins = Core.CollectWindows(it.processName, it.windowTitle);
-
-                    tries++;
-
-                }
-
-                foreach (var h in wins)
-
-                {
-
-                    P.ShowWindow(h, Core.SW_SHOW);
-
-                    P.ShowWindow(h, 9 /*SW_RESTORE*/);
-
-                }
-
-                if (wins.Count > 0)
-
-                    P.SetForegroundWindow(wins[0]);
-
-                else if (started)
-
-                    Core.Log("picker: no window found for '" + it.name + "' after start (background app?)");
-
-            }
-
-            Core.Log("picker: '" + it.name + "' " + (started ? "started" : "already running") +
-
-                (it.script ? " (script, launch-only)" : " window(s) shown"));
-
-        }
-
-
-
-        // address of user32!DefWindowProcW (unmanaged default wndproc)
-
-        static IntPtr DefWindowProcAddress()
-
-        {
-
-            IntPtr u32 = LoadLibrary("user32.dll");
-
-            return GetProcAddress(u32, "DefWindowProcW");
 
         }
 
     }
 
 }
-

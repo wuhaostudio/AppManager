@@ -14,9 +14,10 @@ using AppManager.Ui;
 //
 // This file keeps ONLY the hotkey listener: a standard RegisterHotKey on a
 // hidden message window in its own thread. On WM_HOTKEY it calls
-// AppManager.Ui.Picker.Show() on that same thread (the picker pumps the
-// thread's message queue itself and blocks until closed); pressing the
-// hotkey again while the picker is open toggles it closed.
+// AppManager.Ui.Picker.Show(), which is NON-BLOCKING: each open picker runs
+// on its own background thread with its own WinForms message loop, so the
+// watcher keeps pumping and a second hotkey press re-enters Show() and
+// closes the open picker (toggle).
 namespace AppManager.Engine
 {
     static class Program
@@ -167,9 +168,9 @@ namespace AppManager.Engine
                 if (gr == -1) { Core.Log("hotkey: GetMessage error " + Marshal.GetLastWin32Error()); Thread.Sleep(100); continue; }
                 if (m.message == WM_HOTKEY)
                 {
-                    // blocks on this thread until the picker closes; pressing
-                    // the hotkey again while open is handled inside the picker
-                    // (it is pumping this thread's queue) as a toggle-off.
+                    // non-blocking: the picker runs on its own thread;
+                    // pressing the hotkey again while open is handled inside
+                    // Picker.Show() (toggle-off)
                     try { Picker.Show(); }
                     catch (Exception ex) { Core.Log("picker error: " + ex); }
                 }

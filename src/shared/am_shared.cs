@@ -156,6 +156,8 @@ namespace AppManager.Shared
         [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int max);
         [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+        [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+        [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
     }
 
     // ---------- script launchers: host interpreter + how to build the command line ----------
@@ -548,7 +550,26 @@ namespace AppManager.Shared
         {
             int n = 0;
             foreach (var h in CollectWindows(proc, title))
-                if (P.IsWindowVisible(h) && P.ShowWindow(h, SW_HIDE)) n++;
+            {
+                if (!P.IsWindowVisible(h)) continue;
+                if (P.IsIconic(h))
+                {
+                    // minimized to the taskbar -> the app has no tray-minimize
+                    // path; hide it fully. Tray icons (if any) live in the
+                    // app's own NotifyIcon and are not affected by this.
+                    if (P.ShowWindow(h, SW_HIDE)) n++;
+                }
+                else
+                {
+                    // normally visible -> let the app minimize natively: its
+                    // own "minimize to tray" handler runs, which is what
+                    // creates/keeps its tray icon. Apps without tray support
+                    // end up iconic on the taskbar and the SW_HIDE branch
+                    // catches them on a later poll tick.
+                    P.SendMessage(h, 0x0112 /*WM_SYSCOMMAND*/, new IntPtr(0xF020 /*SC_MINIMIZE*/), IntPtr.Zero);
+                    n++;
+                }
+            }
             return n;
         }
 

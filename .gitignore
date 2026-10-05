@@ -4,6 +4,7 @@ config.json
 am.log
 am-engine.pid
 am-engine.stop.txt
+tests/bin/
 
 # dev-process docs (local only, not for the public repo)
 Intent.md

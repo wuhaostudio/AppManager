@@ -44,6 +44,7 @@ The CLI and the engine have **no IPC** between them — they coordinate only via
 - **Per-item monitor time** — a unified poll-hide monitor duration per app item (default 30s); script items have no monitor time (launch-only); `--time` accepts `15s`, `30`, `5000ms`
 - **Continuous monitor** — after logon the engine re-hides windows every 250ms for the whole monitor window, so late popups get caught too
 - **Global hotkey picker** — one `am hotkey` sets a global shortcut (e.g. `Ctrl+0`) that pops a semi-transparent app picker: arrows select, Enter opens, Esc closes; TOPMOST is auto-released ~1.5s after opening so it never blocks you
+- **Native window hiding, tray icons preserved** — hiding goes through the app's own "minimize to tray" path (`SC_MINIMIZE`), so tray-capable apps (IM clients etc.) keep their tray icons; apps that end up on the taskbar are then fully hidden via `SW_HIDE` as a fallback
 - **One-line restore** — `am show <name>` brings a hidden window back
 - **Program discovery** — `am scan [keyword]` reads the registry Uninstall keys and infers the real exe
 - **Interactive add** — bare `am add` drops into a step-by-step Q&A
@@ -106,7 +107,9 @@ C:\project\AppManager\              ← dev / source
 │   ├── engine\am_engine.cs    # engine entry (silent start + hotkey listener)
 │   └── ui\am_picker.cs        # app picker window (global hotkey, compiled into the engine)
 ├── tests\
-│   └── picker_test.cs         # picker acceptance test (A render / B z-order / C drag / D logic)
+│   ├── picker_test.cs         # picker acceptance test (A render / B z-order / C drag / D logic)
+│   ├── tray_test.cs           # native-hide / tray-preserve acceptance test (N1 hide / N2 picker restore)
+│   └── window_probe.cs        # picker window interactive probe (manual drag/resize/keyboard, non-asserting)
 ├── scripts\
 │   ├── install_am.ps1         # register the logon task
 │   └── uninstall_am.ps1       # uninstall
@@ -266,8 +269,12 @@ that is not already running, then for T seconds it polls every 250ms and hides a
 There is **no** distinction between "already running" vs "cold-started" — the window may pop up
 at any moment during T and gets caught on the next tick.
 
+Hiding is two-tiered: a visible window first goes through the app's own "minimize to tray"
+(`SC_MINIMIZE`), which keeps the tray icon of tray-capable apps; an app that ends up on the taskbar
+(no tray support) is then fully hidden via `SW_HIDE` on the next tick.
+
 ```
-logon → start-if-needed → for T seconds: hide visible windows every 250ms → standby
+logon → start-if-needed → for T seconds: hide every 250ms (SC_MINIMIZE → SW_HIDE fallback) → standby
 ```
 
 Accepted `--time` formats: `30s` = 30s; `30` (<1000) = 30s; `30000` (>=1000) = 30000ms.

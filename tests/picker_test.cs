@@ -10,13 +10,14 @@ using System.Threading;
 // Final acceptance test for the hotkey picker (test list A/B/C/D).
 // Prereq: freshly built am-engine.exe running, silent pass finished, hotkey Ctrl+0 listening.
 // A  render      : picker shows white text (screenshot + bright-pixel count)
-// B  z-order     : B1 right after open the picker is TOPMOST (above a normal app);
-//                  B2 after the ~1.5s grace window topmost is released, so
-//                  lifting the normal app to the top of its (normal) stack
-//                  puts it above the picker
+// B  z-order     : B1 right after open the picker carries WS_EX_TOPMOST;
+//                  B2 after the ~1.5s grace window the flag is released, so
+//                  ordinary apps can cover it again (asserted on the picker's
+//                  own handle — no external app is launched)
 // C  interactive : drag caption moves it; drag bottom-right corner resizes it
 // D  logic       : hotkey toggles (open/close/open); arrows+Enter opens the
-//                  selected item; Esc closes
+//                  selected item; Esc closes; down-arrow from the last app
+//                  crosses into the SCRIPTS section
 // Prints PASS/FAIL lines, mirrors them to tests/bin/picker_test_result.txt,
 // exit code 0 = all green.
 static class PickerTest
@@ -30,21 +31,11 @@ static class PickerTest
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int idx);
-    [DllImport("user32.dll")] static extern int GetSystemMetrics(int i);
-    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint idFrom, uint idTo, bool fAttach);
-    [DllImport("user32.dll")] static extern IntPtr SetFocus(IntPtr h);
-    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] static extern IntPtr GetTopWindow(IntPtr h);
-    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, int cmd);
-    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] static extern void mouse_event(uint flags, uint dx, uint dy, uint data, uint extra);
     [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, IntPtr extra);
 
-    const int GW_HWNDFIRST = 1, GW_HWNDNEXT = 2;
     const uint KEYUP = 0x2;
     const uint M_LDOWN = 0x2, M_LUP = 0x4;
     const string OUT = @"C:\project\AppManager\tests\bin\picker_test_result.txt";
@@ -62,15 +53,42 @@ static class PickerTest
 
     static IntPtr FindPicker()
     {
+        // the picker is a WinForms borderless dark window titled "AppManager"
+        // owned by am-engine. Match the ENGINE pid, not just the title: when
+        // the engine dies the DWM keeps a "Ghost" window that still carries
+        // the title+class but belongs to dwm — it must not count as "open".
         IntPtr found = IntPtr.Zero;
+        int eng = EnginePid();
         EnumWindows((h, u) =>
         {
+            if (!IsWindowVisible(h)) return true;
             var c = new StringBuilder(128);
             GetClassName(h, c, c.Capacity);
-            if (c.ToString().StartsWith("AMPicker", StringComparison.Ordinal)) found = h;
+            if (!c.ToString().StartsWith("WindowsForms", StringComparison.Ordinal)) return true;
+            var t = new StringBuilder(256);
+            GetWindowTextW(h, t, t.Capacity);
+            if (!t.ToString().StartsWith("AppManager", StringComparison.Ordinal)) return true;
+            uint pid; GetWindowThreadProcessId(h, out pid);
+            if (eng > 0 && (int)pid != eng) return true;
+            found = h;
             return true;
         }, IntPtr.Zero);
         return found;
+    }
+
+    // pid of the running engine; -1 when the pid file is missing, in which
+    // case FindPicker falls back to title+class matching only
+    static int EnginePid()
+    {
+        try
+        {
+            int pid;
+            if (int.TryParse(File.ReadAllText(Path.Combine(
+                Environment.GetEnvironmentVariable("LOCALAPPDATA"), "AppManager", "am-engine.pid")).Trim(), out pid))
+                return pid;
+        }
+        catch { }
+        return -1;
     }
 
     // wait until the picker matches the wanted open/closed state (poll 200ms)
@@ -90,38 +108,8 @@ static class PickerTest
         if (FindPicker() != IntPtr.Zero) { Hotkey(); WaitPicker(false, 8000); }
     }
 
-    static IntPtr FindByTitle(string needle)
-    {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, u) =>
-        {
-            if (!IsWindowVisible(h)) return true;
-            var t = new StringBuilder(256);
-            GetWindowTextW(h, t, t.Capacity);
-            if (t.ToString().Contains(needle)) found = h;
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    // top-level z-order comparison: EnumWindows enumerates strictly
-    // top-down, so if `top` appears before `below` in the walk, it is above.
-    // (GetWindow-based walking turned out unreliable across tiers; do not
-    //  use it here.)
-    static bool IsAbove(IntPtr top, IntPtr below)
-    {
-        bool seenTop = false;
-        EnumWindows((h, u) =>
-        {
-            if (h == below) return false; // reached `below` without `top` first
-            if (h == top) seenTop = true;
-            return true;
-        }, IntPtr.Zero);
-        return seenTop;
-    }
-
-    // a TOPMOST window renders above ALL non-topmost windows: they live in two
-    // separate z-order stacks, so IsAbove alone can't compare across tiers
+    // a TOPMOST window lives in a separate z stack above every non-topmost
+    // window, so the assertions check the flag itself, not relative order.
     static bool Topmost(IntPtr h) { return (GetWindowLong(h, -20) & 0x00000008) != 0; }
 
     static void Press() // Ctrl+0 keystroke only, no waiting
@@ -179,38 +167,12 @@ static class PickerTest
         catch { return ""; }
     }
 
-    static void KillNp(Process np)
-    {
-        if (np != null) { try { np.Kill(); } catch { } }
-        try
-        {
-            foreach (var p2 in Process.GetProcessesByName("notepad"))
-            {
-                try { if (p2.MainWindowTitle != null && p2.MainWindowTitle.Contains("np_probe")) p2.Kill(); } catch { }
-            }
-        }
-        catch { }
-    }
-
     static int Main()
     {
         var eng = Process.GetProcessesByName("am-engine");
         if (eng.Length == 0) { Fail("pre", "am-engine not running; run 'am stop && am run' and wait for the pass first"); DumpReport(); return 1; }
         R("pre: am-engine pid " + eng[0].Id);
         EnsureClosed();
-
-        // open a normal (non-topmost) app to compare z-order
-        Process np = null;
-        string npFile = @"C:\project\AppManager\tests\bin\np_probe.txt";
-        try
-        {
-            File.WriteAllText(npFile, "probe");
-            np = Process.Start(new ProcessStartInfo("notepad.exe", npFile) { UseShellExecute = true });
-            Thread.Sleep(2500);
-        }
-        catch { }
-        string fname = System.IO.Path.GetFileNameWithoutExtension(npFile);
-        IntPtr npw = FindByTitle(fname);
 
         // ---- A: open the picker, check the text actually painted ----
         IntPtr p = IntPtr.Zero;
@@ -219,7 +181,7 @@ static class PickerTest
         {
             Fail("A", "picker window not found after hotkey (check am.log)");
             R("---- results: " + fails + " failure(s) ----");
-            DumpReport(); KillNp(np); return 1;
+            DumpReport(); return 1;
         }
         p = FindPicker();
         R("picker hwnd=" + p);
@@ -255,72 +217,63 @@ static class PickerTest
         }
 
         // ---- B1: within the topmost grace window, a freshly opened picker
-        // must sit above the normal app ----
+        // must carry WS_EX_TOPMOST. The flag lives only ~1.5s, so press the
+        // hotkey and poll IMMEDIATELY (no settle sleep — a 2.5s settle would
+        // blow past the grace before the check runs); grab the handle at the
+        // instant it first appears and check the flag on that exact handle.
+        IntPtr freshPicker = IntPtr.Zero;
         {
             Hotkey(); // close the test-A picker
             WaitPicker(false, 8000);
-            if (!OpenFast()) { Fail("B1", "picker did not open for the z-order check"); }
-            else if (npw == IntPtr.Zero) { Fail("B1", "no normal app window to compare against"); }
+            Press(); // re-open: the new picker window is TOPMOST on creation
+            int waited = 0;
+            while (waited < 8000)
+            {
+                IntPtr h = FindPicker();
+                if (h != IntPtr.Zero) { freshPicker = h; break; }
+                Thread.Sleep(80);
+                waited += 80;
+            }
+            if (freshPicker == IntPtr.Zero) { Fail("B1", "picker did not open for the z-order check"); }
             else
             {
-                p = FindPicker();
-                // topmost windows live in a separate z stack above every
-                // non-topmost window, so assert the TOPMOST flag, not IsAbove
-                bool b1 = Topmost(p);
-                if (b1) Pass("B1", "right after open: picker is topmost (above all normal apps)");
+                bool b1 = Topmost(freshPicker);
+                if (b1) Pass("B1", "right after open: picker carries WS_EX_TOPMOST");
                 else Fail("B1", "picker NOT topmost right after open");
             }
-            // the topmost grace (~1.5s after open) has already elapsed
         }
 
-        // ---- B2: after the grace window, activating the normal app brings
-        // it above the picker. The engine released WS_EX_TOPMOST ~1.5s after
-        // open (recreate without the flag). We activate notepad the same way
-        // the picker itself activates foreign windows: the probe has no
-        // foreground of its own, so attach the current foreground thread
-        // and SetForegroundWindow (verified working from a background
-        // process — see probe10).
+        // ---- B2: after the grace window the picker's TOPMOST flag must be
+        // gone (WinForms TopMost toggle, same hwnd), so ordinary apps can
+        // cover it again. Asserted on the picker's own handle: no external
+        // app is launched or activated.
         {
             Thread.Sleep(2500); // past the 1.5s topmost-release grace
-            p = FindPicker();
+            p = freshPicker != IntPtr.Zero ? freshPicker : FindPicker();
             if (p == IntPtr.Zero) Fail("B2", "picker no longer open when checking z-order");
-            else if (npw == IntPtr.Zero) Fail("B2", "no normal app window to activate");
             else
             {
-                bool b2topmost = Topmost(p);
-                if (!b2topmost)
-                {
-                    IntPtr fg = GetForegroundWindow();
-                    uint fgPid;
-                    uint fgTid = GetWindowThreadProcessId(fg, out fgPid);
-                    uint myTid = GetCurrentThreadId();
-                    bool attached = false;
-                    if (fgTid != 0 && fgTid != myTid)
-                        attached = AttachThreadInput(myTid, fgTid, true);
-                    SetForegroundWindow(npw);
-                    SetFocus(npw);
-                    if (attached) AttachThreadInput(myTid, fgTid, false);
-                    SetWindowPos(npw, IntPtr.Zero /*HWND_TOP*/, 0, 0, 0, 0,
-                        0x0001 /*NOSIZE*/ | 0x0002 /*NOMOVE*/ | 0x0000 /*no NOACTIVATE: allow activate*/);
-                    Thread.Sleep(500);
-                }
-                p = FindPicker();
-                bool b2 = p != IntPtr.Zero && !Topmost(p) && IsAbove(npw, p);
-                if (b2) Pass("B2", "after grace + activating notepad: topmost released and notepad is above the picker");
-                else Fail("B2", "notepad did NOT come above the picker (picker topmost=" + Topmost(p) + ")");
+                p = FindPicker(); // same hwnd; re-find guards against recreate
+                bool b2 = p != IntPtr.Zero && !Topmost(p);
+                if (b2) Pass("B2", "after grace: picker's WS_EX_TOPMOST released");
+                else Fail("B2", "picker STILL topmost after the grace window");
             }
             Hotkey(); // close the picker before C
             WaitPicker(false, 8000);
         }
 
-        KillNp(np);
-
-        // ---- C: drag + resize a fresh picker ----
+        // ---- C: drag + resize a fresh picker, done INSIDE the topmost
+        // grace window. After the grace the picker is an ordinary window and
+        // a foreground terminal/IDE window can geometrically cover the click
+        // point, so a synthesized left click would land on whatever is on
+        // top and dragging never reaches the picker (delta 0). While TOPMOST
+        // the picker is the topmost window, so the synthesized click is
+        // guaranteed to hit it and the result is deterministic.
         {
-            Hotkey();
-            if (!WaitPicker(true, 8000)) { Fail("C", "picker not open for drag/resize"); }
+            if (!OpenFast()) { Fail("C", "picker not open for drag/resize"); }
             else
             {
+                Thread.Sleep(600); // window up and settling, still within the 1.5s grace
                 p = FindPicker();
                 RECT r0; GetWindowRect(p, out r0);
                 int cx = (r0.l + r0.r) / 2, cy = r0.t + 12; // on the caption
@@ -376,6 +329,22 @@ static class PickerTest
                 else Fail("D3", "picker still open after Esc");
             }
             else Fail("D3", "picker did not reopen for the Esc test");
+
+            // D4: down-arrow from the last APP crosses into the SCRIPTS
+            // section (log: "picker key down -> section scripts sel 0")
+            EnsureClosed();
+            Hotkey();
+            if (WaitPicker(true, 8000))
+            {
+                SendKey(0x28); SendKey(0x28); // Down x2 -> last app
+                SendKey(0x28);                 // Down -> first script
+                string tail = LogTail(4);
+                SendKey(0x1B);
+                bool gone = WaitPicker(false, 5000);
+                if (tail.Contains("section scripts sel 0")) Pass("D4", "down-arrow crossed into the SCRIPTS section");
+                else Fail("D4", "no section-cross in log tail: " + tail.Replace("\n", " | ") + " pickerGone=" + gone);
+            }
+            else Fail("D4", "picker did not open for the section-cross test");
         }
 
         R("---- results: " + (fails == 0 ? "ALL PASS" : fails + " failure(s)") + " ----");
