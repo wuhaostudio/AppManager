@@ -22,10 +22,10 @@ namespace AppManager.Cli
             {
                 case "scan": DoScan(args); break;
                 case "add": DoAdd(args); break;
+                case "update": DoUpdate(args); break;
                 case "remove": DoRemove(args); break;
                 case "list": DoList(); break;
-                case "show": DoShow(args); break;
-                case "start": DoStart(); break;
+                case "start": DoStart(args); break;
                 case "run": DoRun(); break;
                 case "stop": DoStop(); break;
                 case "launchers": DoLaunchers(args); break;
@@ -35,30 +35,25 @@ namespace AppManager.Cli
             return 0;
         }
 
-        // ---------- table rendering: left-aligned cols, full-width separator ----------
+        // ---------- table rendering: delegates to the shared Style renderer
+        // (colour + CJK-aware padding; colours vanish when output is redirected)
         static void PrintTable(string[] headers, List<string[]> rows)
         {
-            int cols = headers.Length;
-            int[] w = new int[cols];
-            for (int c = 0; c < cols; c++) w[c] = headers[c].Length;
-            foreach (var r in rows)
-                for (int c = 0; c < cols; c++)
-                    if (r[c] != null && r[c].Length > w[c]) w[c] = r[c].Length;
-            const int gap = 2;
-            int total = 0;
-            for (int c = 0; c < cols; c++) total += w[c] + gap;
-            total -= gap;
+            Style.Table(headers, rows);
+        }
 
-            string h = "";
-            for (int c = 0; c < cols; c++) h += (c < cols - 1) ? headers[c].PadRight(w[c] + gap) : headers[c];
-            Console.WriteLine(h);
-            Console.WriteLine(new string('-', total));
-            foreach (var r in rows)
-            {
-                string line = "";
-                for (int c = 0; c < cols; c++) line += (c < cols - 1) ? (r[c] ?? "").PadRight(w[c] + gap) : (r[c] ?? "");
-                Console.WriteLine(line);
-            }
+        static void PrintTable(string[] headers, List<string[]> rows, Func<int, int, ConsoleColor?> cellColor)
+        {
+            Style.Table(headers, rows, null, cellColor);
+        }
+
+        // STATE / AT LOGON cells: green = as intended, yellow = look here, grey = idle
+        static ConsoleColor? StateColor(string st)
+        {
+            if (st == "HIDDEN" || st == "RUNNING") return ConsoleColor.Green;
+            if (st == "visible") return ConsoleColor.Yellow;
+            if (st == "off" || st == "no-window" || st == "not-started") return ConsoleColor.DarkGray;
+            return null;
         }
 
         // human label for the unified monitor window — concrete values only
@@ -82,13 +77,13 @@ namespace AppManager.Cli
             foreach (var r in rows)
                 if (kw.Length == 0 || r[0].IndexOf(kw, StringComparison.OrdinalIgnoreCase) >= 0) filtered.Add(r);
 
-            Console.WriteLine(string.Format("Found {0} installed program(s){1}. Filter='{2}'",
+            Style.Info(string.Format("Found {0} installed program(s){1}. Filter='{2}'",
                 filtered.Count, filtered.Count == 1 ? "" : "s", kw));
             var table = new List<string[]>();
             foreach (var r in filtered) table.Add(new string[] { r[0], r[1] });
             PrintTable(new[] { "PROGRAM", "EXE" }, table);
             Console.WriteLine();
-            Console.WriteLine("To manage one:  am add <exePath>   (or just 'am add' for interactive)");
+            Style.Dim("To manage one:  am add <exePath>   (or just 'am add' for interactive)");
         }
 
         static void ScanRoot(RegistryKey root, string sub, HashSet<string> seen, List<string[]> rows)
@@ -147,6 +142,7 @@ namespace AppManager.Cli
             string exe = null, name = null, title = null, launcher = null;
             int window = 0;
             bool hasWindow = false;
+            bool autostart = true;
             for (int i = 1; i < a.Length; i++)
             {
                 string t = a[i].ToLowerInvariant();
@@ -154,6 +150,7 @@ namespace AppManager.Cli
                 else if (t == "--title") { if (i + 1 < a.Length) title = a[++i]; }
                 else if (t == "--time") { if (i + 1 < a.Length) { window = ParseSec(a[++i], 30000); hasWindow = true; } }
                 else if (t == "--launcher") { if (i + 1 < a.Length) launcher = a[++i]; }
+                else if (t == "--no-autostart") autostart = false;
                 else if (exe == null) exe = a[i];
             }
 
@@ -188,6 +185,14 @@ namespace AppManager.Cli
                     if (launcher == "(none known)") launcher = "";
                 }
 
+                // logon auto-start question (last). Default yes, so pressing
+                // Enter keeps the classic behaviour; "n" registers the item as
+                // on-demand (listed + in the picker, never started at logon).
+                Console.Write((isScript ? "5" : "4") + ") start it silently at logon? [Y/n]: ");
+                p = Console.ReadLine();
+                string ap = p.Trim().ToLowerInvariant();
+                autostart = !(ap == "n" || ap == "no");
+
                 // interactive mode: no default-poll-time question — app items default to
                 // 30s in the engine; script items are launch-only (no window hiding).
                 Console.WriteLine();
@@ -197,7 +202,7 @@ namespace AppManager.Cli
             bool isScriptItem = IsScriptExt(exe);
             if (isScriptItem && hasWindow)
             {
-                Console.WriteLine("[warn] --time is ignored for script items (launch-only, no window hiding)");
+                Style.Warn("[warn] --time is ignored for script items (launch-only, no window hiding)");
                 window = 0;
             }
             var cfg = Core.Load();
@@ -206,7 +211,7 @@ namespace AppManager.Cli
             // target must exist
             if (!File.Exists(exe))
             {
-                Console.WriteLine("[error] target not found, NOT added: " + exe);
+                Style.Err("[error] target not found, NOT added: " + exe);
                 return;
             }
 
@@ -215,7 +220,7 @@ namespace AppManager.Cli
                 var resolved = Launchers.ResolveFor(exe, launcher, null, cfg.extLaunchers);
                 if (resolved == null)
                 {
-                    Console.WriteLine("[error] no launcher/interpreter available for '" + exe + "', NOT added");
+                    Style.Err("[error] no launcher/interpreter available for '" + exe + "', NOT added");
                     Console.WriteLine("  built-in: " + Launchers.KnownList().Replace("\n", "\n  "));
                     if (cfg.extLaunchers.Count > 0)
                     {
@@ -233,11 +238,11 @@ namespace AppManager.Cli
                 if (!string.IsNullOrEmpty(resolved.Host) && !File.Exists(resolved.Host)
                     && !resolved.Host.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
                 {
-                    Console.WriteLine("[warn] host '" + resolved.Host + "' not found on disk (added anyway)");
+                    Style.Warn("[warn] host '" + resolved.Host + "' not found on disk (added anyway)");
                 }
                 else if (!string.IsNullOrEmpty(resolved.Host) && resolved.Host.IndexOf('\\') >= 0 && !File.Exists(resolved.Host))
                 {
-                    Console.WriteLine("[error] host not found: " + resolved.Host + ", NOT added");
+                    Style.Err("[error] host not found: " + resolved.Host + ", NOT added");
                     return;
                 }
 
@@ -259,6 +264,7 @@ namespace AppManager.Cli
             it.windowTitle = title == null ? "" : title;
             it.silentWindowMs = isScriptItem ? 0 : window; // scripts: launch-only, no poll-time
             it.enabled = true;
+            it.autostart = autostart;
 
             // dedupe by TARGET PATH first, then NAME
             int idx = -1;
@@ -276,16 +282,23 @@ namespace AppManager.Cli
             if (idx >= 0) { mode = "updated"; cfg.items[idx] = it; }
             else { mode = "added"; cfg.items.Add(it); }
             Core.Save(cfg);
+            string logon = it.autostart ? "" : ", logon=on-demand";
             string extra = isScriptItem
-                ? "  (host=" + it.hostExe + ", launch-only, no window hiding)"
-                : "  (silent=" + SilentLabel(it.silentWindowMs) + ")";
+                ? "  (host=" + it.hostExe + ", launch-only, no window hiding" + logon + ")"
+                : "  (silent=" + SilentLabel(it.silentWindowMs) + logon + ")";
             Core.Log("cli " + mode + " '" + name + "' -> " + exe + " " + extra);
-            Console.WriteLine(mode + " '" + name + "' -> " + exe + "  " + extra);
-            Console.WriteLine("Takes effect at next logon (or run 'am stop && am run' now).");
+            Style.Ok(mode + " '" + name + "' -> " + exe + "  " + extra);
+            if (it.autostart)
+                Style.Dim("Takes effect at next logon (or run 'am stop && am run' now).");
+            else
+            {
+                Style.Warn("On-demand item: the logon pass never starts it and never hides its windows.");
+                Style.Dim("Start it from the hotkey picker (Enter) or with 'am start " + name + "'.");
+            }
         }
 
-        // detect known script extensions
-        static bool IsScriptExt(string path)
+        // detect known script extensions (shared with the `am update` table editor)
+        internal static bool IsScriptExt(string path)
         {
             string ext = Path.GetExtension(path);
             ext = ext == null ? "" : ext.ToLowerInvariant();
@@ -324,18 +337,18 @@ namespace AppManager.Cli
         static void DoRemove(string[] a)
         {
             string nm = a.Length >= 2 ? a[1] : null;
-            if (nm == null) { Console.WriteLine("usage: am remove <name>"); return; }
+            if (nm == null) { Style.Warn("usage: am remove <name>"); return; }
             var cfg = Core.Load();
             int idx = -1;
             for (int i = 0; i < cfg.items.Count; i++)
                 if (string.Equals(cfg.items[i].name, nm, StringComparison.OrdinalIgnoreCase)) { idx = i; break; }
-            if (idx < 0) { Console.WriteLine("no item named '" + nm + "'"); return; }
+            if (idx < 0) { Style.Err("no item named '" + nm + "'"); return; }
             var removed = cfg.items[idx];
             cfg.items.RemoveAt(idx);
             Core.Save(cfg);
             Core.Log("cli remove '" + nm + "'");
-            Console.WriteLine("removed '" + nm + "' (" + removed.exe + ")");
-            Console.WriteLine("Takes effect at next logon (the running engine already did its pass).");
+            Style.Ok("removed '" + nm + "' (" + removed.exe + ")");
+            Style.Dim("Takes effect at next logon (the running engine already did its pass).");
         }
 
         // ---------- list: configured items split into APPS / SCRIPTS, with live state ----------
@@ -354,7 +367,7 @@ namespace AppManager.Cli
                 if (it.script)
                 {
                     string st = it.enabled ? (procs > 0 ? "RUNNING" : "not-started") : "off";
-                    scriptRows.Add(new string[] { it.name, running, it.launcher == "" ? "auto" : it.launcher, st, it.exe });
+                    scriptRows.Add(new string[] { it.name, running, it.launcher == "" ? "auto" : it.launcher, it.autostart ? "silent" : "on-demand", st, it.exe });
                 }
                 else
                 {
@@ -363,7 +376,7 @@ namespace AppManager.Cli
                     foreach (var h in wins) { if (P.IsWindowVisible(h)) vis++; else hid++; }
                     string win = "(" + vis + "/" + hid + ")";
                     string st = it.enabled ? (hid > 0 ? "HIDDEN" : (vis > 0 ? "visible" : "no-window")) : "off";
-                    appRows.Add(new string[] { it.name, running, win, SilentLabel(it.silentWindowMs), st, it.exe });
+                    appRows.Add(new string[] { it.name, running, win, SilentLabel(it.silentWindowMs), it.autostart ? "silent" : "on-demand", st, it.exe });
                     if (!string.IsNullOrEmpty(it.windowTitle))
                         notes.Add(it.name + " hides only windows whose title contains \"" + it.windowTitle + "\"");
                 }
@@ -373,47 +386,121 @@ namespace AppManager.Cli
             if (appRows.Count == 0) Console.WriteLine("  (none)");
             else
             {
-                PrintTable(new[] { "NAME", "RUNNING", "WINDOWS(v/h)", "MONITOR", "STATE", "TARGET" }, appRows);
-                Console.WriteLine("  MONITOR = poll-hide window after logon (default 30s; per-item, set via --time).");
+                Func<int, int, ConsoleColor?> appColors = delegate(int r, int c)
+                {
+                    if (c == 4) return appRows[r][4] == "on-demand" ? ConsoleColor.Yellow : (ConsoleColor?)null;
+                    if (c == 5) return StateColor(appRows[r][5]);
+                    if (c == 1) return appRows[r][1] == "-" ? ConsoleColor.DarkGray : (ConsoleColor?)null;
+                    return null;
+                };
+                PrintTable(new[] { "NAME", "RUNNING", "WINDOWS(v/h)", "MONITOR", "AT LOGON", "STATE", "TARGET" }, appRows, appColors);
+                Style.Dim("  MONITOR = poll-hide window after logon (default 30s; per-item, set via --time).");
             }
             Console.WriteLine();
             Console.WriteLine("SCRIPTS (launch-only at logon, no window hiding)");
             if (scriptRows.Count == 0) Console.WriteLine("  (none)");
             else
-                PrintTable(new[] { "NAME", "RUNNING", "LAUNCHER", "STATE", "TARGET" }, scriptRows);
+            {
+                Func<int, int, ConsoleColor?> scriptColors = delegate(int r, int c)
+                {
+                    if (c == 3) return scriptRows[r][3] == "on-demand" ? ConsoleColor.Yellow : (ConsoleColor?)null;
+                    if (c == 4) return StateColor(scriptRows[r][4]);
+                    if (c == 1) return scriptRows[r][1] == "-" ? ConsoleColor.DarkGray : (ConsoleColor?)null;
+                    return null;
+                };
+                PrintTable(new[] { "NAME", "RUNNING", "LAUNCHER", "AT LOGON", "STATE", "TARGET" }, scriptRows, scriptColors);
+            }
             Console.WriteLine();
-            foreach (var t in notes) Console.WriteLine("  " + t);
+            foreach (var t in notes) Style.Dim("  " + t);
+            bool anyOnDemand = false;
+            foreach (var it in cfg.items) if (it.enabled && !it.autostart) anyOnDemand = true;
+            if (anyOnDemand)
+            {
+                Style.Dim("  AT LOGON=silent: the engine pass starts it at logon and hides its windows.");
+                Style.Warn("  AT LOGON=on-demand: registered only — never started by the pass;");
+                Style.Warn("    launch it from the hotkey picker (Enter) or with 'am start <name>'.");
+            }
             int e = Core.EnginePid();
             string hk = Hotkey.Parse(cfg.hotkey).Valid ? cfg.hotkey : "";
-            Console.WriteLine(string.Format("  {0} item(s). engine: {1}   config: {2}",
-                cfg.items.Count, e > 0 ? "running (pid " + e + ")" : "not running", Core.CfgPath));
-            if (hk == "") Console.WriteLine("  HOTKEY: (none) — set one with 'am hotkey'");
+            Console.Write(string.Format("  {0} item(s). engine: ", cfg.items.Count));
+            Style.Write(e > 0 ? "running (pid " + e + ")" : "not running", e > 0 ? ConsoleColor.Green : ConsoleColor.DarkGray);
+            if (e <= 0 && Core.StopRequested())
+                Style.Warn("   stopped by request ('am run' resumes; the keep-alive watchdog stays off until then)");
+            Style.Dim("   config: " + Core.CfgPath);
+            if (hk == "") Style.Dim("  HOTKEY: (none) — set one with 'am hotkey'");
             else
             {
-                Console.WriteLine("  HOTKEY: " + hk + "  (global app-picker shortcut; effective from next engine start)");
-                Console.WriteLine("  (press " + hk + " -> semi-transparent picker window: arrows select, Enter opens, Esc closes)");
+                Console.Write("  HOTKEY: ");
+                Style.Write(hk, ConsoleColor.Cyan);
+                Style.Dim("  (global app-picker shortcut; effective from next engine start)");
+                Style.Dim("  (press " + hk + " -> semi-transparent picker window: arrows select, Enter opens, Esc closes)");
             }
         }
 
-        // ---------- show ----------
-        static void DoShow(string[] a)
+        // ---------- update: interactive config table ----------
+        // `am update`         -> every item (apps + scripts) in an editable table
+        // `am update <name>`  -> just that item
+        static void DoUpdate(string[] a)
         {
             string nm = a.Length >= 2 ? a[1] : null;
-            if (nm == null) { Console.WriteLine("usage: am show <name>"); return; }
             var cfg = Core.Load();
-            var it = Core.FindItem(cfg, nm);
-            if (it == null) { Console.WriteLine("no item named '" + nm + "'"); return; }
-            int n = Core.ShowWindows(it.processName, it.windowTitle);
-            Core.Log("cli show '" + nm + "': restored " + n + " window(s)");
-            Console.WriteLine("restored " + n + " window(s) for '" + nm + "'");
+            if (nm != null && Core.FindItem(cfg, nm) == null)
+            {
+                Style.Err("no item named '" + nm + "'");
+                return;
+            }
+            Core.Log("cli update" + (nm != null ? " '" + nm + "'" : "") + " (table editor)");
+            UpdateUi.Run(cfg, nm);
         }
 
         // ---------- start ----------
-        static void DoStart()
+        // `am start`         -> one-shot pass, same semantics as logon (on-demand items untouched)
+        // `am start <name>`  -> start that item if needed, then bring its main window back —
+        //                       exactly what Enter does in the hotkey picker (absorbed `am show`)
+        static void DoStart(string[] a)
         {
+            string nm = a.Length >= 2 ? a[1] : null;
+            if (nm != null) { DoStartOne(nm); return; }
+
             Core.Log("cli start (one-shot)");
             Core.DoPass(Core.Load());
-            Console.WriteLine("one-shot pass complete. 'am list' to verify.");
+            Style.Ok("one-shot pass complete. 'am list' to verify.");
+            Style.Dim("(on-demand items are not part of this pass — start one with 'am start <name>')");
+        }
+
+        static void DoStartOne(string nm)
+        {
+            var cfg = Core.Load();
+            var it = Core.FindItem(cfg, nm);
+            if (it == null) { Style.Err("no item named '" + nm + "'"); return; }
+            if (!it.enabled) Style.Warn("(note: '" + it.name + "' is disabled in config)");
+
+            bool started = false;
+            if (Core.ProcCount(it.processName) == 0)
+            {
+                started = Core.StartApp(it);
+                if (!started) { Style.Err("failed to start '" + it.name + "' (target/host missing? see am.log)"); return; }
+            }
+
+            if (it.script)
+            {
+                Core.Log("cli start '" + it.name + "': launched=" + started + " (script, launch-only)");
+                Style.Ok((started ? "started '" : "already running '") + it.name + "' (script, launch-only; no window to restore)");
+                return;
+            }
+
+            // cold starts need a moment before their main window exists
+            int n = 0;
+            for (int i = 0; i < 20 && n == 0; i++)
+            {
+                n = Core.ShowWindows(it.processName, it.windowTitle);
+                if (n == 0) Thread.Sleep(250);
+            }
+            Core.Log("cli start '" + it.name + "': started=" + started + " restored=" + n);
+            if (n > 0)
+                Style.Ok((started ? "started '" : "restored '") + it.name + "' -> " + it.exe);
+            else
+                Style.Warn("'" + it.name + "' is running but has no main window yet; try again in a moment");
         }
 
         // ---------- run ----------
@@ -422,16 +509,39 @@ namespace AppManager.Cli
             int existing = Core.EnginePid();
             if (existing > 0)
             {
-                Console.WriteLine("engine already running (pid " + existing + "); not starting another");
+                Style.Warn("engine already running (pid " + existing + "); not starting another");
                 return;
             }
             string exe = Core.EngineExe();
             if (!File.Exists(exe))
             {
-                Console.WriteLine("engine not found: " + exe);
-                Console.WriteLine("run build.ps1 first (or place am-engine.exe next to am.exe)");
+                Style.Err("engine not found: " + exe);
+                Style.Dim("run build.ps1 first (or place am-engine.exe next to am.exe)");
                 return;
             }
+
+            // an explicit start overrides an earlier stop: the keep-alive
+            // watchdog may revive the engine again from here on
+            Core.ClearStopRequest();
+
+            // Prefer the installed logon task as the parent. An engine spawned
+            // directly by this CLI is a child of whatever shell/agent started
+            // us: if that process tree is torn down (a job-object kill), the
+            // engine dies with it — silently, leaving the hotkey dead with no
+            // log line. Started through the task, the engine's parent is the
+            // Task Scheduler service, so it survives the CLI and its caller.
+            if (StartViaTask())
+            {
+                int pid = WaitEnginePid(8000);
+                if (pid > 0)
+                {
+                    Core.Log("cli run: started engine pid=" + pid + " via task '" + TaskName + "'");
+                    Style.Ok("engine started (pid " + pid + ", via task '" + TaskName + "'); silent window in progress, CLI exiting");
+                    return;
+                }
+                Style.Dim("task '" + TaskName + "' did not produce an engine within 8s; starting directly");
+            }
+
             try
             {
                 var psi = new ProcessStartInfo(exe)
@@ -444,13 +554,56 @@ namespace AppManager.Cli
                 {
                     p.WaitForInputIdle(2000);
                     Core.Log("cli run: spawned engine pid=" + p.Id);
-                    Console.WriteLine("engine started (pid " + p.Id + "); silent window in progress, CLI exiting");
+                    Style.Ok("engine started (pid " + p.Id + "); silent window in progress, CLI exiting");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine("failed to start engine: " + ex.Message);
+                Style.Err("failed to start engine: " + ex.Message);
             }
+        }
+
+        const string TaskName = "AppManager";
+
+        // ask Task Scheduler to run the installed task; false when the task is
+        // missing (portable use) or the request fails
+        static bool StartViaTask()
+        {
+            try
+            {
+                var psi = new ProcessStartInfo("schtasks.exe", "/run /tn \"" + TaskName + "\"")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+                using (var p = Process.Start(psi))
+                {
+                    string outp = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
+                    p.WaitForExit(5000);
+                    if (p.ExitCode == 0) return true;
+                    Core.Log("cli run: task start refused (" + outp.Trim() + ")");
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Core.Log("cli run: task start failed: " + ex.Message);
+                return false;
+            }
+        }
+
+        // the engine writes am-engine.pid at startup: poll for it
+        static int WaitEnginePid(int timeoutMs)
+        {
+            for (int waited = 0; waited < timeoutMs; waited += 250)
+            {
+                int pid = Core.EnginePid();
+                if (pid > 0) return pid;
+                Thread.Sleep(250);
+            }
+            return 0;
         }
 
         // ---------- stop ----------
@@ -480,7 +633,7 @@ namespace AppManager.Cli
             if (!killed && msg == "") msg = "engine not running";
             try { Directory.CreateDirectory(Path.GetDirectoryName(Core.StopPath)); File.WriteAllText(Core.StopPath, DateTime.Now + "  " + msg + "\n"); } catch { }
             Core.Log("cli stop: " + msg);
-            Console.WriteLine("stop: " + msg);
+            if (killed) Style.Ok("stop: " + msg); else Style.Dim("stop: " + msg);
         }
 
         // ---------- launchers ----------
@@ -698,14 +851,13 @@ namespace AppManager.Cli
 
         static int prevEsc;
 
+        // Modifier snapshot at capture time. The VK/MOD mapping lives in
+        // Hotkey.ModifiersDown (src/shared) so it stays next to the constants
+        // and can be exercised directly: VK_CONTROL (0x11) -> MOD_CONTROL,
+        // VK_MENU/Alt (0x12) -> MOD_ALT.
         static int ModSnapshot()
         {
-            int m = 0;
-            if ((KeyNative.GetAsyncKeyState(0x11) & 0x8000) != 0) m |= Hotkey.MOD_ALT;
-            if ((KeyNative.GetAsyncKeyState(0x12) & 0x8000) != 0) m |= Hotkey.MOD_CONTROL;
-            if ((KeyNative.GetAsyncKeyState(0x10) & 0x8000) != 0) m |= Hotkey.MOD_SHIFT;
-            if ((KeyNative.GetAsyncKeyState(0x5B) & 0x8000) != 0 || (KeyNative.GetAsyncKeyState(0x5C) & 0x8000) != 0) m |= Hotkey.MOD_WIN;
-            return m;
+            return Hotkey.ModifiersDown();
         }
 
         // drain any characters the capture keys buffered into the console, so
@@ -731,30 +883,42 @@ namespace AppManager.Cli
         // ---------- help ----------
         static void Help()
         {
-            Console.WriteLine("am — AppManager V7 CLI (console). Engine = am-engine.exe (no window).");
+            Style.Info("am — AppManager V7 CLI (console). Engine = am-engine.exe (no window).");
             Console.WriteLine();
-            Console.WriteLine("Commands:");
+            Style.Info("Commands:");
+            Style.Info("  -- manage (config) --");
             Console.WriteLine("  scan [keyword]   list installed programs (registry Uninstall) with guessed exe");
-            Console.WriteLine("  add <exe|script> [--name n] [--title t] [--time 15s|30|5000ms] [--launcher L]");
-            Console.WriteLine("                   add/update a managed item.");
+            Console.WriteLine("  add <exe|script> [--name n] [--title t] [--time 15s|30|5000ms] [--launcher L] [--no-autostart]");
+            Console.WriteLine("                   add a managed item (same target path updates it in place).");
             Console.WriteLine("                   L = host/interpreter name (powershell, cmd, wscript, autohotkey, python, or a learned id); auto-picked by extension when omitted");
-            Console.WriteLine("                   duplicate target path updates in place; broken config is rejected, not saved");
-            Console.WriteLine("  add             interactive mode: ask path, name, title, launcher (if script)");
+            Console.WriteLine("                   --no-autostart = register it as ON-DEMAND: listed in 'am list' and the hotkey picker,");
+            Console.WriteLine("                   but never started (and never window-hidden) by the logon pass");
+            Console.WriteLine("  add             interactive mode: ask path, name, title, launcher (if script), logon auto-start");
+            Console.WriteLine("  update [name]    config editor, two levels: pick an item from the list (↑↓, Enter), then edit");
+            Console.WriteLine("                   its fields (↑↓ pick a field, Enter edits — inline line editor for text fields,");
+            Console.WriteLine("                   option list for logon auto-start / enabled / launcher).");
+            Console.WriteLine("                   Esc always steps one level back, q quits; every accepted edit is saved immediately");
             Console.WriteLine("  remove <name>    remove a managed item");
-            Console.WriteLine("  list             all managed items with live state: APPS (running, windows, monitor, state) + SCRIPTS (running, launcher, state) + engine + hotkey");
-            Console.WriteLine("  show <name>       restore a hidden window (apps only)");
-            Console.WriteLine("  start             one-shot pass (start-if-needed + hide), then exit");
-            Console.WriteLine("  run               spawn the resident engine (detached), then CLI exits");
-            Console.WriteLine("  stop              stop the engine");
+            Console.WriteLine();
+            Style.Info("  -- look --");
+            Console.WriteLine("  list             all managed items with live state: APPS (running, windows, monitor, AT LOGON, state) + SCRIPTS (running, launcher, AT LOGON, state) + engine + hotkey");
             Console.WriteLine("  launchers [list|learn|forget]   view / add / remove extension→interpreter mappings");
+            Console.WriteLine();
+            Style.Info("  -- run --");
+            Console.WriteLine("  start             one-shot pass (start-if-needed + hide), then exit — on-demand items are skipped");
+            Console.WriteLine("  start <name>      start that item if needed, then bring its main window back");
+            Console.WriteLine("  run               start the resident engine (via the 'AppManager' task, so it outlives this shell), then CLI exits");
+            Console.WriteLine("  stop              stop the engine and hold it off: the keep-alive watchdog stays quiet until the next 'am run' / logon");
+            Console.WriteLine();
+            Style.Info("  -- hotkey --");
             Console.WriteLine("  hotkey [set|clear] set the global AppManager hotkey (interactive capture, two verifications);");
             Console.WriteLine("                   the hotkey pops a semi-transparent picker window in the engine:");
             Console.WriteLine("                   arrow keys select an app, Enter opens its window, Esc closes");
             Console.WriteLine();
-            Console.WriteLine("Apps (.exe): launched + window hidden. Scripts (.ahk/.ps1/.bat/.vbs/.py/...): launch-only via host, no window hiding.");
-            Console.WriteLine("MONITOR window: one fixed poll-hide time per app item (default 30s); scripts are launch-only.");
-            Console.WriteLine("Config: " + Core.CfgPath);
-            Console.WriteLine("Log:    " + Core.LogPath);
+            Style.Dim("Apps (.exe): launched + window hidden. Scripts (.ahk/.ps1/.bat/.vbs/.py/...): launch-only via host, no window hiding.");
+            Style.Dim("MONITOR window: one fixed poll-hide time per app item (default 30s); scripts are launch-only.");
+            Style.Dim("Config: " + Core.CfgPath);
+            Style.Dim("Log:    " + Core.LogPath);
         }
     }
 }

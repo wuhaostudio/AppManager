@@ -27,6 +27,18 @@ namespace AppManager.Shared
         [DataMember] public string hostArgs = "";         // custom args template, {script} placeholder
         [DataMember] public bool script = false;         // true => launch-only at logon (no window hiding)
         [DataMember] public bool enabled = true;
+        // false => "on-demand": registered only. The logon pass neither starts
+        // it nor hides its windows; start it explicitly from the hotkey picker
+        // (Enter) or `am start <name>`. It still shows in `am list` + picker.
+        [DataMember] public bool autostart = true;
+
+        // DataContractJsonSerializer builds items WITHOUT running field
+        // initializers, so a config.json written before "autostart" existed
+        // would read as false and silently turn every item into on-demand.
+        // Prime the default before members are read; an explicit value in the
+        // file still overwrites it.
+        [OnDeserializing]
+        void PrimeAutostart(StreamingContext ctx) { autostart = true; }
     }
 
     [DataContract]
@@ -54,6 +66,13 @@ namespace AppManager.Shared
     {
         public const int MOD_ALT = 0x1, MOD_CONTROL = 0x2, MOD_SHIFT = 0x4, MOD_WIN = 0x8;
         public const int MOD_NOREPEAT = 0x4000;
+
+        // Virtual-key codes of the modifier keys. They are NOT the MOD_* flags
+        // above: VK_CONTROL is 0x11 while MOD_CONTROL is 0x2, VK_MENU (Alt) is
+        // 0x12 while MOD_ALT is 0x1. Confusing the two silently swaps Ctrl and
+        // Alt in every captured combo.
+        public const int VK_SHIFT = 0x10, VK_CONTROL = 0x11, VK_MENU = 0x12;
+        public const int VK_LWIN = 0x5B, VK_RWIN = 0x5C;
 
         public class Combo
         {
@@ -145,10 +164,25 @@ namespace AppManager.Shared
             if ((mods & MOD_WIN) != 0) r |= 0x8;
             return r | MOD_NOREPEAT;
         }
+
+        // live modifier state, for the CLI's interactive capture (no keyboard
+        // hooks: GetAsyncKeyState polling). Lives here — next to the VK/MOD
+        // constants — because the two are easy to mix up.
+        public static int ModifiersDown()
+        {
+            int m = 0;
+            if ((P.GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) m |= MOD_CONTROL;
+            if ((P.GetAsyncKeyState(VK_MENU) & 0x8000) != 0) m |= MOD_ALT;
+            if ((P.GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0) m |= MOD_SHIFT;
+            if ((P.GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
+                (P.GetAsyncKeyState(VK_RWIN) & 0x8000) != 0) m |= MOD_WIN;
+            return m;
+        }
     }
 
     public static class P
     {
+        [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vk);
         [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
         [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
         [DllImport("user32.dll")] public static extern bool EnumWindows(Delegate cb, IntPtr p);
@@ -226,6 +260,17 @@ namespace AppManager.Shared
                 sb.Append(h);
             }
             return sb.ToString().Trim();
+        }
+
+        // launcher ids for the interactive editor: built-ins first, then learned ones
+        public static List<string> Ids(List<ExtLauncher> learned)
+        {
+            var ids = new List<string>();
+            foreach (var d in defs) if (!ids.Contains(d.Id)) ids.Add(d.Id);
+            if (learned != null)
+                foreach (var e in learned)
+                    if (e != null && !string.IsNullOrEmpty(e.id) && !ids.Contains(e.id)) ids.Add(e.id);
+            return ids;
         }
 
         // is this extension covered by a built-in launcher?
@@ -453,6 +498,23 @@ namespace AppManager.Shared
             catch { }
         }
 
+        // ---------- "stop" request marker ----------
+        // `am stop` writes it, any NORMAL engine start (the logon task or
+        // `am run`) clears it, and a `--keepalive` start refuses to run while
+        // it exists. Without it the keep-alive watchdog would fight `am stop`
+        // and resurrect the engine in the middle of a build.
+        public static bool StopRequested()
+        {
+            try { return File.Exists(StopPath); }
+            catch { return false; }
+        }
+
+        public static void ClearStopRequest()
+        {
+            try { if (File.Exists(StopPath)) File.Delete(StopPath); }
+            catch { }
+        }
+
         // ---------- process / window helpers ----------
         public static int ProcCount(string proc)
         {
@@ -578,7 +640,7 @@ namespace AppManager.Shared
             return titled;
         }
 
-        // The single window the picker / `am show` should bring back: the
+        // The single window the picker / `am start <name>` should bring back: the
         // largest titled app window (or, when nothing is titled, the largest
         // app window). Ties keep the top-most in z-order.
         public static IntPtr FindMainWindow(string proc, string title)
@@ -658,9 +720,12 @@ namespace AppManager.Shared
         // may pop up at any time during T, and we catch it on the next tick.
         public static void DoPass(Config cfg)
         {
+            // on-demand items (autostart=false) are registered only: this pass
+            // neither launches nor hides them. The picker (Enter) or
+            // `am start <name>` is what starts them.
             var enabled = new List<Item>();
-            foreach (var i in cfg.items) if (i.enabled) enabled.Add(i);
-            if (enabled.Count == 0) { Log("pass: no enabled items"); return; }
+            foreach (var i in cfg.items) if (i.enabled && i.autostart) enabled.Add(i);
+            if (enabled.Count == 0) { Log("pass: no auto-start items"); return; }
 
             const int iv = 250;        // poll interval
             const int defT = 30000;   // default monitor window = 30s

@@ -1,4 +1,4 @@
-# AppManager
+﻿# AppManager
 
 <p align="center">
   <img src="../assets/logo.svg" alt="AppManager logo" width="120"><br>
@@ -27,7 +27,7 @@ Two small .NET executables compiled with the stock `csc.exe` — no Visual Studi
 | `am.exe` | `/target:exe` (console) | CLI: discover programs, manage config, control the engine |
 | `am-engine.exe` | `/target:winexe` (no window) | Engine: silently starts apps at logon, polls to hide windows, then stands by |
 
-A **scheduled task** (registered by `scripts\install_am.ps1`) launches the engine windowlessly at logon.
+Two **scheduled tasks** (registered by `scripts\install_am.ps1`) run the engine windowlessly: `AppManager` (launches it at logon) and `AppManagerKeepAlive` (a 5-minute backstop that fills in whenever the engine is gone, so the hotkey cannot stay dead for long after an external kill).
 The CLI and the engine have **no IPC** between them — they coordinate only via `config.json`, the pid file, and the OS process table.
 
 ```
@@ -46,9 +46,12 @@ The CLI and the engine have **no IPC** between them — they coordinate only via
 - **Global hotkey picker** — one `am hotkey` sets a global shortcut (e.g. `Ctrl+0`) that pops a semi-transparent app picker: arrows step one row at a time (no skipped rows; at a section edge the next press crosses into the other section), Enter opens, Esc closes; TOPMOST is auto-released ~1.5s after opening so it never blocks you
 - **Main window only** — opening and hiding both target the app's own main window: Chromium/Electron render hosts, tray hosts and IME helper windows are never shown or minimized by am
 - **Native window hiding, tray icons preserved** — hiding goes through the app's own "minimize to tray" path (`SC_MINIMIZE`), so tray-capable apps (IM clients etc.) keep their tray icons; apps that end up on the taskbar are then fully hidden via `SW_HIDE` as a fallback. Closing the window is the app's own minimize-to-tray, so the process and its tray icon survive
-- **One-line restore** — `am show <name>` brings a hidden window back
+- **One-line restore / on-demand start** — `am start <name>`: starts the item if it is not running, otherwise brings its **main window** back (the same logic as pressing Enter in the picker)
 - **Program discovery** — `am scan [keyword]` reads the registry Uninstall keys and infers the real exe
-- **Interactive add** — bare `am add` drops into a step-by-step Q&A
+- **Interactive add** — bare `am add` drops into a step-by-step Q&A (including "start it silently at logon?")
+- **Table-style config editing** — `am update [name]` works in two levels: first pick an app/script from the one-row-per-item list, then edit that item's fields (a `字段 | 值` form); arrows select, Enter edits (inline line editor for text, option list for enums), `Esc` steps one level back, and every accepted edit is written to config.json immediately
+- **Terminal look** — filled title bar, cyan headers, dim rules, right-aligned numbers, and state colouring (green = as intended, yellow = look here, grey = idle — e.g. `on-demand` yellow, `HIDDEN` green); CJK text is aligned by **display width**. Colours only apply in a real terminal: piped or logged output degrades to plain text with no ANSI escapes
+- **On-demand items (no logon start)** — `am add --no-autostart` registers an item without starting it: it still shows in `am list` and in the hotkey picker, but the logon pass never starts it and never hides its windows; launch it with Enter in the picker or `am start <name>`
 - **Script launchers** — manage `.ahk/.ps1/.bat/.vbs/.py/.lua/...` scripts; launchers auto-match + learn
 - **Zero footprint** — no tray, no window, no IPC; the engine idles after the monitor window
 - **Single-instance engine** — guaranteed by a named mutex, restart-safe
@@ -79,15 +82,18 @@ Registers a per-user AtLogon windowless task and cleans up deprecated tasks.
 am scan Office                    # find installed programs
 am add "C:\path\app.exe"         # minimal add (default 30s, hide all windows)
 am add "C:\path\app.exe" --name MyApp --title MainWindow --time 30s
-am add                           # interactive (Q&A)
-am list                          # all items + live state (APPS / SCRIPTS sections)
+am add "C:\path\app.exe" --no-autostart    # register only, no logon start (launch on demand)
+am add                           # interactive (Q&A, incl. logon auto-start)
+am list                          # all items + live state + AT LOGON column (APPS / SCRIPTS sections)
+am update                        # editable table of every item (arrows + Enter)
+am update MyApp                  # edit just that item
+am start MyApp                   # start it if needed, otherwise bring its main window back
 am hotkey                        # set the global hotkey (interactive capture, two confirmations)
 am hotkey clear                  # remove the hotkey
-am show MyApp                    # restore window
 am remove MyApp                  # remove entry
 am start                         # one-shot: start + hide, then exit
-am run                           # spawn the resident engine
-am stop                          # stop the engine
+am run                           # start the resident engine (via the logon task: parent = Task Scheduler, so it is not killed with the shell/job that called it)
+am stop                          # stop the engine and hold the keep-alive task off until the next am run / logon
 ```
 
 New items take effect at next logon, or immediately via `am stop && am run`.
@@ -112,7 +118,7 @@ C:\project\AppManager\              ← dev / source
 │   ├── tray_test.cs           # native-hide / tray-preserve acceptance test (N1 hide / N2 picker restore)
 │   └── window_probe.cs        # picker window interactive probe (manual drag/resize/keyboard, non-asserting)
 ├── scripts\
-│   ├── install_am.ps1         # register the logon task
+│   ├── install_am.ps1         # register the logon task + the 5-minute keep-alive task
 │   └── uninstall_am.ps1       # uninstall
 ├── docs\README.en.md           # this file (English)
 ├── build.ps1                   # build → deploy to AppData
@@ -195,7 +201,7 @@ To keep "start AND hide windows", use a regular `.exe` item (app type) instead.
 ## am add parameters
 
 ```
-am add <exe|script> [--name n] [--title t] [--time duration] [--launcher id]
+am add <exe|script> [--name n] [--title t] [--time duration] [--launcher id] [--no-autostart]
 ```
 
 | Param | Required | Description |
@@ -205,8 +211,77 @@ am add <exe|script> [--name n] [--title t] [--time duration] [--launcher id]
 | `--title` | no | window title keyword (empty = hide all windows of the process) |
 | `--time` | no | monitor duration: `30s` / `30` (<1000 = seconds) / `5000ms`; default 30s; ignored for scripts |
 | `--launcher` | no | launcher id (built-in id or learned id); auto-matched when omitted for scripts |
+| `--no-autostart` | no | register only (an "on-demand" item): never started at logon and its windows are never hidden by the logon pass; launch it from the picker (Enter) or with `am start <name>` |
 
 Bare `am add` with no arguments → interactive Q&A mode.
+
+## On-demand items (no logon start)
+
+Some programs belong in am's single entry point (`am list` and the hotkey picker) without being started silently at every logon. Mark them **on-demand** with `--no-autostart` when adding, or later by switching the 登录自启 column to 按需 inside `am update`:
+
+```bash
+am add "C:\path\app.exe" --no-autostart   # no logon start right away
+am update MyApp                           # open the table and set 登录自启 to 按需
+am update                                 # or show that column for every item at once
+```
+
+| Behaviour | Silent logon start (default) | On-demand (`autostart: false`) |
+|---|---|---|
+| Started by the engine at logon | yes | **no** |
+| Windows hidden during the logon monitor | yes (`--time`) | **no** (am leaves its windows alone) |
+| Present in `am list` | yes (AT LOGON=silent) | yes (AT LOGON=on-demand) |
+| Present in the hotkey picker | yes (state stopped / running) | yes (state on-demand) |
+| Enter in the picker | start + restore main window | start + restore main window |
+| `am start` (one-shot pass) | start + hide | untouched |
+| `am start <name>` | start that item + restore its main window | start that item + restore its main window |
+
+The two kinds differ only in "is it started and hidden automatically at logon". An on-demand item starts only when explicitly asked for (Enter in the picker, or `am start <name>`), so am never touches its windows — open it yourself and it just shows.
+
+Note: re-running `am add` for the same target resets it to silent logon start (same handling as `enabled`); keep it on-demand by passing `--no-autostart`, or by switching the column back in `am update`. Items in an older `config.json` without the `autostart` field are treated as silent logon start.
+
+## Table-style editing (am update)
+
+`am update` works in two levels: **pick an item, then edit that item's fields** — you only ever face one item's config at a time, and edits are saved immediately.
+
+```bash
+am update              # list every item → pick one to open its field form
+am update MyApp        # open that item's field form directly
+```
+
+**Level 1 · item list** (one row per app/script; columns `名称 | 类型 | 登录自启 | 启用 | 监控时长 | 目标`)
+
+| Key | Action |
+|---|---|
+| `↑` `↓` | pick an item (wraps at the edges) |
+| `Enter` | open its field form |
+| `q` / `Esc` | quit |
+
+**Level 2 · field form** (one row per field: `字段 | 值`)
+
+| Key | Action |
+|---|---|
+| `↑` `↓` | pick a field (wraps) |
+| `Enter` | edit it: **text fields** open an inline line editor (`Enter` saves · `Esc` cancels · `←→` moves the caret · `Backspace`/`Delete`); **enum fields** open an option list (`←→`/`↑↓` pick · `Enter` applies · `Esc` cancels) |
+| `Esc` | back to the item list (with `am update <name>` there is no list, so it quits) |
+| `q` | quit right away |
+
+**`Esc` always steps exactly one level up** — option list → field form → item list → quit — so nothing traps you. Read-only fields (类型/宿主/启动参数/进程名) say so when you press Enter, and validation failures (duplicate name, missing path, …) keep you in place with a red reason line.
+
+| Field | Type | Rules |
+|---|---|---|
+| 名称 | text | not empty, no duplicate name |
+| 类型 | read-only | app / script (decided by the target extension; use `am add` to change kind) |
+| 应用地址 / 脚本地址 | text | target must exist; app and script items cannot be swapped; changing it re-derives the process name (app) or re-resolves the launcher (script) |
+| 窗口标题 | text | empty = all windows of that process (app items only) |
+| 监控时长 | text | `30s` / `30` / `5000ms` / `0` (app items only) |
+| 启动器 | choice | the 5 built-ins + learned ids; picking one rewrites host path/args/process name (script items) |
+| 宿主 / 启动参数 | read-only | decided by the launcher (use `am launchers learn` to change) |
+| 登录自启 | choice | `静默启动` / `按需` (the `autostart` field) |
+| 启用 | choice | `是` / `否` (the `enabled` field) |
+| 进程名 | read-only | the process name being tracked |
+
+Every accepted edit is **written to `config.json` immediately** (one line in `am.log`), and the status line below the form shows `已保存：…`. It still takes effect at the next logon, or right away with `am stop && am run`.
+When the output is redirected (pipe/file) the command does not go interactive: it prints the item overview plus every field of every item, which keeps it scriptable — colours drop out there automatically, so the output is plain text that can go straight into a log.
 
 ## Global hotkey (app picker)
 
@@ -223,6 +298,8 @@ Behavior details:
 - **Never blocks**: the picker opens topmost, then TOPMOST is released ~1.5s after opening so ordinary apps can cover it; the window can be dragged by its caption and resized from the corner (self-drawn move/resize, no native NC drag loop)
 - **Main window only**: opening an item restores exactly one window (the app's main one) and never touches its render/tray/IME helper windows; after you close it the app's own minimize-to-tray logic takes over and the tray icon stays
 - **Effective from**: the next engine start (`am stop && am run`); while the engine is not running the hotkey does nothing
+- **A dead hotkey is usually a dead engine**: `am list` ends with `engine: not running`, and `am.log` shows nothing after the last `hotkey: listening …` line — that is exactly the "engine is not resident" state, cured by a single `am run`; after an external kill (Task Manager / force-kill) the `AppManagerKeepAlive` task fills in within 5 minutes, **skipping the logon pass** so it neither relaunches apps you closed nor hides windows you are using. If the engine's listener thread ever exits on its own it logs `hotkey: listener ended unexpectedly; restarting` and rebuilds the listener in place (no engine restart needed)
+- **Modifiers are recorded as the system sees them**: capture reads the OS key state, so a key remapper (e.g. `C:\Scripts\WinRemap.ahk` doing `LAlt::LWin`) makes a held Alt capture as `Win+…` — that is the remapped key, not an am deviation; a remapped-away modifier is also a poor choice for a hotkey
 - The picker lists the current `config.json`; script items show up as usual (launch-only, no hiding)
 
 ## Configuration (config.json)
@@ -240,7 +317,8 @@ Behavior details:
       "hostExe": "",
       "hostArgs": "",
       "script": false,
-      "enabled": true
+      "enabled": true,
+      "autostart": true
     }
   ],
   "extLaunchers": [
@@ -252,7 +330,7 @@ Behavior details:
 
 | Field | Description |
 |---|---|
-| `name` | entry name (used by `am show <name>` / `am remove <name>`) |
+| `name` | entry name (used by `am start <name>` / `am update <name>` / `am remove <name>`) |
 | `exe` | target path (.exe or script) |
 | `processName` | process to track (for scripts: the host process name) |
 | `windowTitle` | window title keyword; empty = hide all windows |
@@ -262,6 +340,7 @@ Behavior details:
 | `hostArgs` | args template (`{script}` = target path) |
 | `script` | true = script item (launch only, no hiding) |
 | `enabled` | whether the item is active |
+| `autostart` | start silently at logon; `false` = on-demand item (registered only: never started, never hidden). A `config.json` written before this field existed defaults to `true`, i.e. the previous behaviour |
 | `extLaunchers[]` | learned extension→host mapping table |
 
 ## Monitor timing
@@ -270,6 +349,8 @@ Behavior details:
 that is not already running, then for T seconds it polls every 250ms and hides any visible window.
 There is **no** distinction between "already running" vs "cold-started" — the window may pop up
 at any moment during T and gets caught on the next tick.
+On-demand items (`autostart: false`) are not part of this pass: they are neither started nor hidden
+at logon, and start only when explicitly asked (Enter in the picker / `am start <name>`).
 
 Hiding is two-tiered: the visible **main window** first goes through the app's own "minimize to tray"
 (`SC_MINIMIZE`), which keeps the tray icon of tray-capable apps; an app that ends up on the taskbar

@@ -15,9 +15,11 @@ if (Test-Path $cli) {
 Start-Sleep -Milliseconds 500
 Stop-Process -Name 'am-engine' -Force -ErrorAction SilentlyContinue
 
-# 2) Remove the AppManager scheduled task
-$d = Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-if ($d) { Write-Output "task unregistered: $taskName" } else { Write-Output "task: $taskName not found (nothing to remove)" }
+# 2) Remove the AppManager scheduled tasks (main + keep-alive)
+foreach ($tn in @($taskName, "AppManagerKeepAlive")) {
+    $d = Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
+    if ($d) { Write-Output "task unregistered: $tn" } else { Write-Output "task: $tn not found (nothing to remove)" }
+}
 
 # 3) Delete the program dir (dev dir stays untouched)
 Remove-Item -Path $deployDir -Recurse -Force -ErrorAction SilentlyContinue

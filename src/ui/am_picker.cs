@@ -881,7 +881,12 @@ namespace AppManager.Ui
 
             {
 
-                string state = Core.ProcCount(it.processName) > 0 ? "running" : "stopped";
+                // on-demand items (autostart=false) are registered only: nothing
+                // starts them at logon, so label them as waiting-to-be-launched
+                // rather than "stopped" (which reads like a failure).
+                string state = Core.ProcCount(it.processName) > 0
+                    ? "running"
+                    : (it.autostart ? "stopped" : "on-demand");
 
                 return PadR(it.name, 24) + " " + state;
 
