@@ -637,6 +637,8 @@ namespace AppManager.Ui
 
                 syncing = true;
 
+                var prev = SelectedItem();
+
                 selA = i;
 
                 inScripts = false;
@@ -646,6 +648,8 @@ namespace AppManager.Ui
                 if (listS != null) listS.SelectedIndex = -1;
 
                 syncing = false;
+
+                ToggleSelect(prev, i >= 0 && i < appItems.Count ? appItems[i] : null);
 
                 UpdateStatus();
 
@@ -659,6 +663,8 @@ namespace AppManager.Ui
 
                 syncing = true;
 
+                var prev = SelectedItem();
+
                 selS = i;
 
                 inScripts = true;
@@ -668,6 +674,8 @@ namespace AppManager.Ui
                 if (listA != null) listA.SelectedIndex = -1;
 
                 syncing = false;
+
+                ToggleSelect(prev, i >= 0 && i < scriptItems.Count ? scriptItems[i] : null);
 
                 UpdateStatus();
 
@@ -683,6 +691,70 @@ namespace AppManager.Ui
 
                 status.Text = "Selected: " + (it != null ? it.name : "(no enabled items - add one with 'am add')");
 
+            }
+
+
+
+            // ---------- per-row selection toggle (on-screen <-> tray/hidden) ----------
+            // 0 = stopped, 1 = main window on screen, 2 = running but off-screen
+            static int AppState(Item it)
+
+            {
+
+                if (Core.ProcCount(it.processName) == 0) return 0;
+
+                IntPtr m = Core.FindMainWindow(it.processName, it.windowTitle);
+
+                return Core.WindowOnScreen(m) ? 1 : 2;
+
+            }
+
+
+
+            // A selection move (arrow / click) toggles the row: the previously
+            // selected app row's window is put back to tray/hidden if it had
+            // been shown, and the newly selected row (if a running app) gets
+            // its main window shown on screen. Stopped and script rows are
+            // no-ops. Hide/show are cross-process API calls, so the new row
+            // is verified on-screen after a short poll window; fast moves may
+            // stack timers, which is harmless (they all check the same
+            // on-screen predicate).
+            void ToggleSelect(Item prev, Item next)
+            {
+                // the initial selection (picker construction) has prev == next:
+                // opening the picker must not hide-then-reshow the already
+                // on-screen app — that is the flicker seen in the log.
+                if (prev == next) return;
+                if (prev != null && !prev.script && AppState(prev) == 1)
+                {
+                    Core.HideWindows(prev.processName, prev.windowTitle);
+                    Core.Log("picker row-toggle '" + prev.name + "' -> tray/hidden");
+                }
+                if (next != null && !next.script && AppState(next) == 2)
+                {
+                    Core.ShowWindows(next.processName, next.windowTitle);
+                    BeginToggleVerify(next, 40, 250);
+                }
+            }
+
+            void BeginToggleVerify(Item it, int tries, int ms)
+            {
+                System.Windows.Forms.Timer vt = new System.Windows.Forms.Timer { Interval = ms };
+                int n = 0;
+                vt.Tick += (s, e) =>
+                {
+                    if (Core.WindowOnScreen(Core.FindMainWindow(it.processName, it.windowTitle)))
+                    {
+                        vt.Enabled = false;
+                        Core.Log("picker row-toggle '" + it.name + "' -> on screen");
+                    }
+                    else if (++n >= tries)
+                    {
+                        vt.Enabled = false;
+                        Core.Log("picker row-toggle '" + it.name + "': show issued, main window not detected on screen");
+                    }
+                };
+                vt.Start();
             }
 
 
@@ -1068,8 +1140,12 @@ namespace AppManager.Ui
 
 
 
-            // open the selected item: start it if not running, then restore /
-            // foreground its windows (plain apps); scripts are launch-only.
+            // open the selected item: start it if not running, then bring its
+            // main window back on screen (tray-hidden or taskbar-minimized)
+            // and to the front. The wait-for-window + verify loop runs on a
+            // UI timer so the picker stays responsive (draggable, toggleable)
+            // while a cold-starting app is still coming up. Scripts are
+            // launch-only.
             void OpenSelected()
 
             {
@@ -1090,81 +1166,84 @@ namespace AppManager.Ui
 
                 {
 
-                    // restore exactly ONE window: the app's own main window.
-
-                    // Showing every top-level HWND of the process (renderer
-
-                    // hosts, tray/IME helpers, zero-sized message windows) is
-
-                    // what littered the screen with unrelated windows.
-
-                    IntPtr main = Core.FindMainWindow(it.processName, it.windowTitle);
-
-                    int tries = 0;
-
-                    while (main == IntPtr.Zero && tries < 20)
-
+                    // restore runs on a background thread: OpenSelected()
+                    // closes the picker right away, so a form timer would die
+                    // with the form's message loop and never fire.
+                    var proc = it.processName;
+                    var ttl = it.windowTitle;
+                    var nm = it.name;
+                    new Thread(() =>
                     {
 
-                        Thread.Sleep(250);
+                        // restore exactly ONE window: the app's own main window.
 
-                        main = Core.FindMainWindow(it.processName, it.windowTitle);
+                        // Showing every top-level HWND of the process (renderer
 
-                        tries++;
+                        // hosts, tray/IME helpers, zero-sized message windows)
 
-                    }
+                        // is what littered the screen with unrelated windows.
 
-                    if (main != IntPtr.Zero)
+                        IntPtr main = Core.FindMainWindow(proc, ttl);
 
-                    {
+                        int tries = 0;
 
-                        P.ShowWindow(main, Core.SW_RESTORE);
-
-                        if (!P.IsWindowVisible(main)) P.ShowWindow(main, Core.SW_SHOW);
-
-                        // bring the target app's window to the front. The
-                        // picker holds the foreground for its whole life, so
-                        // SetForegroundWindow needs the attach-to-foreground
-                        // thread dance (the picker's Shown handler uses it too).
-                        try
-
+                        while (main == IntPtr.Zero && tries < 20)
                         {
-
-                            IntPtr fg = GetForegroundWindow();
-
-                            uint fgPid;
-
-                            uint fgTid = GetWindowThreadProcessId(fg, out fgPid);
-
-                            uint myTid = GetCurrentThreadId();
-
-                            bool attached = false;
-
-                            if (fgTid != 0 && fgTid != myTid)
-
-                                attached = AttachThreadInput(myTid, fgTid, true);
-
-                            P.SetForegroundWindow(main);
-
-                            if (attached) AttachThreadInput(myTid, fgTid, false);
-
+                            Thread.Sleep(250);
+                            main = Core.FindMainWindow(proc, ttl);
+                            tries++;
                         }
 
-                        catch { }
+                        if (main != IntPtr.Zero)
+                        {
+                            ShowAppMain(main, nm);
+                            if (!Core.WindowOnScreen(main))
+                            {
+                                // some apps restow/rehide themselves; a short
+                                // retry catches the stragglers
+                                Thread.Sleep(500);
+                                main = Core.FindMainWindow(proc, ttl);
+                                if (main != IntPtr.Zero) ShowAppMain(main, nm);
+                            }
+                        }
+                        else
+                            Core.Log("picker: no window found for '" + nm + "' " + (started ? "after start" : "while running") + " (background app?)");
 
-                    }
-
-                    else if (started)
-
-                        Core.Log("picker: no window found for '" + it.name + "' after start (background app?)");
+                    }) { IsBackground = true, Name = "am-open-wait" }.Start();
 
                 }
 
                 Core.Log("picker: '" + it.name + "' " + (started ? "started" : "already running") +
 
-                    (it.script ? " (script, launch-only)" : " window(s) shown"));
+                    (it.script ? " (script, launch-only)" : " window show in progress"));
 
                 Close();
+
+            }
+
+
+            // show the app's main window and force it to the front. Returns
+            // whether it ended up visible + non-iconic (the on-screen state).
+            bool ShowAppMain(IntPtr main, string name)
+
+            {
+
+                P.ShowWindow(main, Core.SW_RESTORE);
+
+                if (!P.IsWindowVisible(main)) P.ShowWindow(main, Core.SW_SHOW);
+
+                // bring the target app's window to the front. The picker holds
+
+                // the foreground for its whole life, so SetForegroundWindow
+
+                // needs the attach-to-foreground-thread dance.
+                Core.BringToFront(main);
+
+                bool ok = Core.WindowOnScreen(main);
+
+                Core.Log("picker: '" + name + "' main window " + (ok ? "on screen" : "show issued, not visible yet"));
+
+                return ok;
 
             }
 

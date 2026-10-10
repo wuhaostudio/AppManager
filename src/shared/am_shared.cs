@@ -195,6 +195,9 @@ namespace AppManager.Shared
         [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
         [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int index);
         [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+        [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idFrom, uint idTo, bool fAttach);
+        [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
         [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
     }
 
@@ -695,6 +698,33 @@ namespace AppManager.Shared
             return n;
         }
 
+        // Cross-process SetForegroundWindow: only the thread that owns the
+        // foreground is allowed to activate, so attach to it to borrow that
+        // right (the same dance the picker's Shown handler uses).
+        public static void BringToFront(IntPtr h)
+        {
+            try
+            {
+                IntPtr fg = P.GetForegroundWindow();
+                uint fgPid;
+                uint fgTid = P.GetWindowThreadProcessId(fg, out fgPid);
+                uint myTid = P.GetCurrentThreadId();
+                bool attached = false;
+                if (fgTid != 0 && fgTid != myTid)
+                    attached = P.AttachThreadInput(myTid, fgTid, true);
+                P.SetForegroundWindow(h);
+                if (attached) P.AttachThreadInput(myTid, fgTid, false);
+            }
+            catch { }
+        }
+
+        // the window is actually back on screen: visible and not iconic
+        public static bool WindowOnScreen(IntPtr h)
+        {
+            try { return h != IntPtr.Zero && P.IsWindowVisible(h) && !P.IsIconic(h); }
+            catch { return false; }
+        }
+
         // Bring an app back on screen: restore its main window only. Works
         // for all three states a managed app can be in — minimized on the
         // taskbar (iconic), hidden by its own "minimize to tray" handler
@@ -709,7 +739,7 @@ namespace AppManager.Shared
             // (ShowWindow(SW_HIDE) from its tray code never sets the iconic
             // bit), so force a plain show as well.
             if (!P.IsWindowVisible(h)) P.ShowWindow(h, SW_SHOW);
-            P.SetForegroundWindow(h);
+            BringToFront(h);
             return 1;
         }
 
