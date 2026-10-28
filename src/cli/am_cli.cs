@@ -493,7 +493,7 @@ namespace AppManager.Cli
             int n = 0;
             for (int i = 0; i < 20 && n == 0; i++)
             {
-                n = Core.ShowWindows(it.processName, it.windowTitle);
+                n = Core.ShowWindows(it.processName, it.windowTitle, it.name);
                 if (n == 0) Thread.Sleep(250);
             }
             Core.Log("cli start '" + it.name + "': started=" + started + " restored=" + n);

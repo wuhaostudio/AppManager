@@ -727,12 +727,12 @@ namespace AppManager.Ui
                 if (prev == next) return;
                 if (prev != null && !prev.script && AppState(prev) == 1)
                 {
-                    Core.HideWindows(prev.processName, prev.windowTitle);
+                    Core.HideWindows(prev);
                     Core.Log("picker row-toggle '" + prev.name + "' -> tray/hidden");
                 }
                 if (next != null && !next.script && AppState(next) == 2)
                 {
-                    Core.ShowWindows(next.processName, next.windowTitle);
+                    Core.ShowWindows(next.processName, next.windowTitle, next.name);
                     BeginToggleVerify(next, 40, 250);
                 }
             }
@@ -1172,6 +1172,7 @@ namespace AppManager.Ui
                     var proc = it.processName;
                     var ttl = it.windowTitle;
                     var nm = it.name;
+                    var item = it;
                     new Thread(() =>
                     {
 
@@ -1196,14 +1197,14 @@ namespace AppManager.Ui
 
                         if (main != IntPtr.Zero)
                         {
-                            ShowAppMain(main, nm);
+                            ShowAppMain(main, item);
                             if (!Core.WindowOnScreen(main))
                             {
                                 // some apps restow/rehide themselves; a short
                                 // retry catches the stragglers
                                 Thread.Sleep(500);
                                 main = Core.FindMainWindow(proc, ttl);
-                                if (main != IntPtr.Zero) ShowAppMain(main, nm);
+                                if (main != IntPtr.Zero) ShowAppMain(main, item);
                             }
                         }
                         else
@@ -1222,13 +1223,14 @@ namespace AppManager.Ui
             }
 
 
-            // show the app's main window and force it to the front. Returns
-            // whether it ended up visible + non-iconic (the on-screen state).
-            bool ShowAppMain(IntPtr main, string name)
+            // show the app's main window and force it to the front, back in
+            // the state it was hidden in (maximized / normal — recorded at
+            // hide time). Returns whether it ended up visible + non-iconic.
+            bool ShowAppMain(IntPtr main, Item it)
 
             {
 
-                P.ShowWindow(main, Core.SW_RESTORE);
+                Core.RestoreAppWindow(it, main);
 
                 if (!P.IsWindowVisible(main)) P.ShowWindow(main, Core.SW_SHOW);
 
@@ -1241,7 +1243,7 @@ namespace AppManager.Ui
 
                 bool ok = Core.WindowOnScreen(main);
 
-                Core.Log("picker: '" + name + "' main window " + (ok ? "on screen" : "show issued, not visible yet"));
+                Core.Log("picker: '" + it.name + "' main window " + (ok ? "on screen" : "show issued, not visible yet"));
 
                 return ok;
 

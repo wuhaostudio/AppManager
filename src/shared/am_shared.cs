@@ -32,6 +32,12 @@ namespace AppManager.Shared
         // (Enter) or `am start <name>`. It still shows in `am list` + picker.
         [DataMember] public bool autostart = true;
 
+        // win-state persistence fields (am-winstate.json only, absent from
+        // config.json -> default false/empty): how the window looked at its
+        // last native hide, so the restore can bring back EXACTLY that.
+        [DataMember] public bool maximized = false;
+        [DataMember] public P.RECT rcNormal = default(P.RECT);
+
         // DataContractJsonSerializer builds items WITHOUT running field
         // initializers, so a config.json written before "autostart" existed
         // would read as false and silently turn every item into on-demand.
@@ -194,7 +200,28 @@ namespace AppManager.Shared
         [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
         [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
         [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int index);
+        [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
         [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+        [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
+        // Measured native WINPLACEMENT layout on this system (user32 fills
+        // 48 bytes, reports length=44): length, showCmd, one state int,
+        // ptMin(2), ptMax(2), rcNormal(4 ints at byte 28). The classic
+        // doc layout (BOOLs + rcNormal at byte 20) does NOT match what
+        // user32 writes here, so the struct mirrors the measurement.
+        // IsZoomed() remains the maximized check; rcNormal is read at the
+        // offsets below (it is valid for a maximized window too).
+        [StructLayout(LayoutKind.Sequential)] public struct WINDOWPLACEMENT
+        {
+            public int length, showCmd;
+            public int state;
+            public int ptMinX, ptMinY;
+            public int ptMaxX, ptMaxY;
+            public RECT rcNormal;
+            public int _pad;
+        }
+        [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+        [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr h, out WINDOWPLACEMENT wp);
+        [DllImport("user32.dll")] public static extern bool SetWindowPlacement(IntPtr h, ref WINDOWPLACEMENT wp);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idFrom, uint idTo, bool fAttach);
         [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
@@ -449,7 +476,7 @@ namespace AppManager.Shared
 
     public static class Core
     {
-        public const int SW_HIDE = 0, SW_SHOW = 5, SW_RESTORE = 9;
+        public const int SW_HIDE = 0, SW_SHOWMAXIMIZED = 3, SW_SHOW = 5, SW_RESTORE = 9;
         public const string EngineProcName = "am-engine";
         public const string EngineExeName = "am-engine.exe";
         public const string MutexName = "AppManagerResident";
@@ -460,6 +487,88 @@ namespace AppManager.Shared
         public static string LogPath = Path.Combine(Dir, "am.log");
         public static string PidPath = Path.Combine(Dir, "am-engine.pid");
         public static string StopPath = Path.Combine(Dir, "am-engine.stop.txt");
+
+        // ---------- window-state persistence (maximized at last hide) ----------
+        // Apps that maximize themselves at startup (Feishu & co.) keep their
+        // NORMAL rectangle at the default small size; SW_RESTORE would drop
+        // them back to that, so HideWindows records which managed windows were
+        // maximized when put away and ShowWindows restores THAT state instead.
+        [DataContract]
+        public class WinState
+        {
+            [DataMember] public List<Item> items = new List<Item>();
+        }
+
+        public static string WinStatePath = Path.Combine(Dir, "am-winstate.json");
+
+        public static WinState LoadWinState()
+        {
+            WinState s = null;
+            try
+            {
+                if (File.Exists(WinStatePath))
+                    using (var fs = File.OpenRead(WinStatePath))
+                    {
+                        var ser = new DataContractJsonSerializer(typeof(WinState));
+                        s = (WinState)ser.ReadObject(fs);
+                    }
+            }
+            catch { s = null; }
+            if (s == null) s = new WinState();
+            if (s.items == null) s.items = new List<Item>();
+            return s;
+        }
+
+        public static void SaveWinState(WinState s)
+        {
+            try
+            {
+                Directory.CreateDirectory(Dir);
+                using (var fs = File.Create(WinStatePath))
+                {
+                    var ser = new DataContractJsonSerializer(typeof(WinState));
+                    ser.WriteObject(fs, s);
+                }
+            }
+            catch (Exception ex) { Log("winstate save failed: " + ex.Message); }
+        }
+
+        // true when the window's pre-hide state was maximized; the normal
+        // rectangle (pre-hide size/position) is recorded alongside it
+        public static bool WasMaximized(string itemName, out P.RECT rcNormal)
+        {
+            rcNormal = default(P.RECT);
+            var s = LoadWinState();
+            foreach (var i in s.items)
+                if (i != null && i.name.Equals(itemName, StringComparison.OrdinalIgnoreCase))
+                {
+                    rcNormal = i.rcNormal;
+                    return i.maximized;
+                }
+            return false;
+        }
+
+        public static void RecordHiddenState(string itemName, bool maximized, P.RECT rcNormal)
+        {
+            var s = LoadWinState();
+            for (int i = s.items.Count - 1; i >= 0; i--)
+                if (s.items[i] != null && s.items[i].name.Equals(itemName, StringComparison.OrdinalIgnoreCase))
+                    s.items.RemoveAt(i);
+            s.items.Add(new Item { name = itemName, maximized = maximized, rcNormal = rcNormal });
+            SaveWinState(s);
+        }
+
+        // re-apply the recorded NORMAL rectangle (size + position) to the
+        // window. Only called when the pre-hide state was NORMAL, so a
+        // maximized window's rcNormal is irrelevant to its on-screen look.
+        public static void ApplyNormalState(string itemName, IntPtr h, P.RECT rc)
+        {
+            if (rc.Right - rc.Left <= 0 || rc.Bottom - rc.Top <= 0) return;
+            // WP_SETPOS(0x0001) = set position+size; WP_NOZORDER(0x0004)
+            // keeps z-order; WP_NOACTIVATE(0x0010) avoids stealing focus.
+            P.SetWindowPos(h, IntPtr.Zero, rc.Left, rc.Top,
+                rc.Right - rc.Left, rc.Bottom - rc.Top, 0x0001 | 0x0004 | 0x0010);
+        }
 
         // ---------- config io ----------
         public static Config Load()
@@ -667,14 +776,34 @@ namespace AppManager.Shared
             return bestTitled != IntPtr.Zero ? bestTitled : bestAny;
         }
 
-        public static int HideWindows(string proc, string title)
+        public static int HideWindows(Item it)
         {
             int n = 0;
+            // remember exactly how the main window looked BEFORE it goes to
+            // the tray (maximized? what normal rectangle?) so the later
+            // restore can bring back that very state.
+            IntPtr main = FindMainWindow(it.processName, it.windowTitle);
+            if (main != IntPtr.Zero)
+            {
+                // Capture the pre-hide geometry while the window still shows it:
+                // GetWindowPlacement's rcNormal carries the normal bounds even
+                // for a currently-maximized window, and fails on a hidden one
+                // (so the SW_RESTORE path can't fall back to it later). Fall
+                // back to the live rect when placement isn't available.
+                bool maxed = P.IsZoomed(main);
+                P.RECT rc = default(P.RECT);
+                P.WINDOWPLACEMENT wp = default(P.WINDOWPLACEMENT);
+                if (!P.GetWindowPlacement(main, out wp))
+                    P.GetWindowRect(main, out rc);
+                else
+                    rc = wp.rcNormal;
+                RecordHiddenState(it.name, maxed, rc);
+            }
             // Only the app's real windows: minimizing every visible top-level
             // HWND also hit the app's own helper windows (Chromium's power /
             // tray / renderer hosts), which is how a "hide" could disturb the
             // app's tray state instead of just putting its window away.
-            foreach (var h in CollectAppWindows(proc, title))
+            foreach (var h in CollectAppWindows(it.processName, it.windowTitle))
             {
                 if (!P.IsWindowVisible(h)) continue;
                 if (P.IsIconic(h))
@@ -725,20 +854,56 @@ namespace AppManager.Shared
             catch { return false; }
         }
 
-        // Bring an app back on screen: restore its main window only. Works
-        // for all three states a managed app can be in — minimized on the
-        // taskbar (iconic), hidden by its own "minimize to tray" handler
-        // (Chromium/Electron clients hide the window outright), or simply
-        // behind other windows.
+        // ---------- restore the window to the state it was hidden in ----------
+        // On-screen check is visible AND non-iconic (a taskbar-minimized
+        // window still counts as "visible" to IsWindowVisible).
+        //   already on screen -> no-op (re-opening must NOT resize/unmaximize
+        //                        a live window — the old SW_RESTORE did that)
+        //   taskbar-minimized -> SW_RESTORE (the un-iconify command)
+        //   tray-hidden       -> SW_SHOW (never touches size)
+        // then re-assert the pre-hide state recorded by HideWindows:
+        //   was maximized     -> SW_SHOWMAXIMIZED (full screen again, even if
+        //                        the app's stale normal rect is a small default)
+        //   was normal        -> SetWindowPos the recorded normal rect (covers
+        //                        apps that never size their normal rectangle
+        //                        themselves)
+        public static bool RestoreAppWindow(Item it, IntPtr h)
+        {
+            if (h == IntPtr.Zero) return false;
+            if (WindowOnScreen(h)) return true;   // nothing to restore
+            P.RECT rc;
+            bool wasMax = WasMaximized(it.name, out rc);
+            if (P.IsIconic(h)) P.ShowWindow(h, SW_RESTORE);
+            else P.ShowWindow(h, SW_SHOW);
+            if (!P.IsWindowVisible(h)) P.ShowWindow(h, SW_SHOW);
+            if (wasMax) P.ShowWindow(h, SW_SHOWMAXIMIZED);
+            else ApplyNormalState(it.name, h, rc);
+            return true;
+        }
+
+        // Bring an app back on screen: restore its main window only, in the
+        // exact state it left (see RestoreState). Works for all three states
+        // a managed app can be in — taskbar-minimized (iconic), hidden by
+        // its own "minimize to tray" handler (Chromium/Electron clients hide
+        // the window outright), or simply behind other windows.
+        // itemName (config item name) keys the persisted pre-hide state;
+        // empty = no persisted state -> plain SW_SHOW.
         public static int ShowWindows(string proc, string title)
+        {
+            return ShowWindows(proc, title, "");
+        }
+
+        public static int ShowWindows(string proc, string title, string itemName)
         {
             IntPtr h = FindMainWindow(proc, title);
             if (h == IntPtr.Zero) return 0;
-            P.ShowWindow(h, SW_RESTORE);
-            // SW_RESTORE does not always un-hide a window the app hid itself
-            // (ShowWindow(SW_HIDE) from its tray code never sets the iconic
-            // bit), so force a plain show as well.
-            if (!P.IsWindowVisible(h)) P.ShowWindow(h, SW_SHOW);
+            if (!string.IsNullOrEmpty(itemName))
+                RestoreAppWindow(new Item { name = itemName }, h);
+            else
+            {
+                P.ShowWindow(h, P.IsIconic(h) ? SW_RESTORE : SW_SHOW);
+                if (!P.IsWindowVisible(h)) P.ShowWindow(h, SW_SHOW);
+            }
             BringToFront(h);
             return 1;
         }
@@ -797,7 +962,7 @@ namespace AppManager.Shared
                 foreach (var it in enabled)
                 {
                     if (it.script) continue;
-                    hides += HideWindows(it.processName, it.windowTitle);
+                    hides += HideWindows(it);
                 }
                 Thread.Sleep(iv);
             }
