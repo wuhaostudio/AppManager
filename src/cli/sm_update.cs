@@ -2,16 +2,17 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
-using AppManager.Shared;
+using StartManager.Shared;
 
-// `am update` — interactive config editor, two levels:
+// `sm update` — interactive config editor, two levels:
 //
-//   level 1  item list    one row per managed app/script (name / kind / logon / enabled /
-//                         monitor / target).  ↑↓ pick a row, Enter opens it.
-//   level 2  field form   the fields of that single item, one per row
-//                         (名称 / 应用地址 / 窗口标题 / 监控时长 / 登录自启 / 启用 …).
+//   level 1  item list    one row per startup item (name / kind / enabled / monitor / target).
+//                         ↑↓ pick a row, Enter opens it.
+//   level 2  field form   the fields of that single item, one per row.
+//                         App:    名称 / 类型 / 应用地址 / 启动参数 / 窗口标题 / 监控时长 / 启用 / 进程名
+//                         Script: 名称 / 类型 / 脚本地址 / 启动器 / 宿主 / 启动参数 / 启用 / 进程名
 //                         ↑↓ pick a field, Enter edits it — a line editor for text
-//                         fields, an option list for enum fields.
+//                         fields, an option list for the enabled flag / launcher.
 //
 // Esc always goes one level up (form -> list -> quit; option list / line editor ->
 // their caller), so nothing traps the user. Accepted edits are saved immediately.
@@ -19,7 +20,7 @@ using AppManager.Shared;
 // Split for testability: every model operation (items / fields / values / validation /
 // ApplyKey / the line-editor feed) is console-free; only Run() and the Draw* helpers
 // touch the terminal.
-namespace AppManager.Cli
+namespace StartManager.Cli
 {
     static class UpdateUi
     {
@@ -27,17 +28,14 @@ namespace AppManager.Cli
         const string F_NAME = "NAME";
         const string F_KIND = "KIND";
         const string F_TARGET = "TARGET";
+        const string F_ARGS = "ARGS";
         const string F_TITLE = "TITLE";
         const string F_MONITOR = "MONITOR";
         const string F_LAUNCHER = "LAUNCHER";
         const string F_HOST = "HOST";
-        const string F_ARGS = "ARGS";
-        const string F_ATLOGON = "ATLOGON";
         const string F_ON = "ON";
         const string F_PROC = "PROC";
 
-        const string V_SILENT = "静默启动";
-        const string V_DEMAND = "按需";
         const string V_YES = "是";
         const string V_NO = "否";
         const string V_ALL = "(全部窗口)";
@@ -65,10 +63,10 @@ namespace AppManager.Cli
             }
             else
             {
+                l.Add(new Field(F_ARGS, "启动参数", false));
                 l.Add(new Field(F_TITLE, "窗口标题", false));
                 l.Add(new Field(F_MONITOR, "监控时长", false));
             }
-            l.Add(new Field(F_ATLOGON, "登录自启", false));
             l.Add(new Field(F_ON, "启用", false));
             l.Add(new Field(F_PROC, "进程名", true));
             return l;
@@ -87,11 +85,6 @@ namespace AppManager.Cli
             return items;
         }
 
-        public static string KindText(Item it)
-        {
-            return it.script ? "脚本" : "应用";
-        }
-
         // ---------- field values ----------
         static string Silent(int ms)
         {
@@ -102,14 +95,17 @@ namespace AppManager.Cli
         public static string FieldText(Item it, string key)
         {
             if (key == F_NAME) return it.name;
-            if (key == F_KIND) return it.script ? "脚本（登录时只启动、不藏窗）" : "应用（登录时启动 + 藏窗）";
+            if (key == F_KIND) return it.script ? "脚本" : "应用";
             if (key == F_TARGET) return it.exe;
+            if (key == F_ARGS)
+            {
+                string v = it.script ? it.hostArgs : it.args;
+                return string.IsNullOrEmpty(v) ? "(无)" : v;
+            }
             if (key == F_TITLE) return string.IsNullOrEmpty(it.windowTitle) ? V_ALL : it.windowTitle;
             if (key == F_MONITOR) return Silent(it.silentWindowMs);
             if (key == F_LAUNCHER) return string.IsNullOrEmpty(it.launcher) ? "auto" : it.launcher;
             if (key == F_HOST) return string.IsNullOrEmpty(it.hostExe) ? "(内置/自动)" : it.hostExe;
-            if (key == F_ARGS) return string.IsNullOrEmpty(it.hostArgs) ? "(无)" : it.hostArgs;
-            if (key == F_ATLOGON) return it.autostart ? V_SILENT : V_DEMAND;
             if (key == F_ON) return it.enabled ? V_YES : V_NO;
             if (key == F_PROC) return it.processName;
             return "";
@@ -119,9 +115,8 @@ namespace AppManager.Cli
         public static List<string> Choices(Config cfg, Item it, string key)
         {
             var l = new List<string>();
-            if (key == F_ATLOGON) { l.Add(V_SILENT); l.Add(V_DEMAND); return l; }
             if (key == F_ON) { l.Add(V_YES); l.Add(V_NO); return l; }
-            if (key == F_LAUNCHER) return Launchers.Ids(cfg.extLaunchers);
+            if (key == F_LAUNCHER && it.script) return Launchers.Ids(cfg.extLaunchers);
             return null;
         }
 
@@ -130,33 +125,44 @@ namespace AppManager.Cli
         {
             if (key != F_LAUNCHER) return FieldText(it, key);
             if (!string.IsNullOrEmpty(it.launcher)) return it.launcher;
-            var r = Launchers.ResolveFor(it.exe, null, null, cfg.extLaunchers);
+            var r = Launchers.ResolveFor(it.exe, null, cfg.extLaunchers);
             return r != null && !string.IsNullOrEmpty(r.Id) ? r.Id : "";
         }
 
         // ---------- edits: null = applied, else the message to show ----------
         public static string ApplyText(Config cfg, Item it, string key, string input)
         {
-            input = input == null ? "" : input.Trim();
+            string v = input == null ? "" : input.Trim();
             if (key == F_NAME)
             {
-                if (input.Length == 0) return "名称不能为空（Esc 取消编辑）";
+                if (v.Length == 0) return "名称不能为空（Esc 取消编辑）";
                 foreach (var o in cfg.items)
-                    if (!object.ReferenceEquals(o, it) && string.Equals(o.name, input, StringComparison.OrdinalIgnoreCase))
-                        return "已有同名条目：" + input;
-                it.name = input;
+                    if (!object.ReferenceEquals(o, it) && string.Equals(o.name, v, StringComparison.OrdinalIgnoreCase))
+                        return "已有同名条目：" + v;
+                it.name = v;
                 return null;
             }
-            if (key == F_TITLE) { it.windowTitle = input; return null; }
+            if (key == F_TARGET) return ApplyTarget(cfg, it, v);
+            if (key == F_ARGS)
+            {
+                if (it.script) return "脚本的启动参数由启动器决定（只读）";
+                it.args = input == null ? "" : input;
+                return null;
+            }
+            if (key == F_TITLE)
+            {
+                if (it.script) return "脚本条目没有窗口标题";
+                it.windowTitle = v;
+                return null;
+            }
             if (key == F_MONITOR)
             {
                 if (it.script) return "脚本条目没有监控时长（只启动、不藏窗）";
                 int ms;
-                if (!TryParseMs(input, out ms)) return "时长格式不对，示例：30s / 30 / 5000ms / 0";
+                if (!TryParseMs(v, out ms)) return "时长格式不对，示例：30s / 30 / 5000ms / 0";
                 it.silentWindowMs = ms;
                 return null;
             }
-            if (key == F_TARGET) return ApplyTarget(cfg, it, input);
             return "该字段不可编辑";
         }
 
@@ -164,34 +170,36 @@ namespace AppManager.Cli
         {
             path = path.Trim().Trim('"');
             if (path.Length == 0) return "地址不能为空（Esc 取消编辑）";
-            bool isScript = Program.IsScriptExt(path);
-            if (it.script && !isScript) return "脚本条目不能指向 .exe（要管 .exe 请用 am add 新建）";
-            if (!it.script && isScript) return ".exe 条目不能指向脚本（要管脚本请用 am add 新建）";
             if (!File.Exists(path)) return "目标不存在：" + path;
+            bool isScript = Program.IsScriptExt(path);
+            if (it.script && !isScript) return "脚本条目不能指向 .exe（要管 .exe 请用 sm add 新建）";
+            if (!it.script && isScript) return ".exe 条目不能指向脚本（要管脚本请用 sm add 新建）";
 
             if (it.script)
             {
-                var r = Launchers.ResolveFor(path, it.launcher, null, cfg.extLaunchers);
-                if (r == null) return "这个后缀没有可用的启动器，先 am launchers learn";
-                it.exe = path;
+                var r = Launchers.ResolveFor(path, it.launcher, cfg.extLaunchers);
+                if (r == null) return "这个后缀没有可用的启动器，先 sm launchers learn";
+                it.exe = Path.GetFullPath(path);
                 it.hostExe = r.Host;
                 it.hostArgs = r.ArgsTemplate;
                 it.processName = r.Proc;
                 if (!string.IsNullOrEmpty(r.Id)) it.launcher = r.Id;
                 return null;
             }
-            it.exe = path;
-            it.processName = Path.GetFileNameWithoutExtension(path);
+            if (!path.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                return "应用条目只能指向 .exe（脚本请用 sm add 新建）";
+            it.exe = Path.GetFullPath(path);
+            it.processName = Path.GetFileNameWithoutExtension(it.exe);
             return null;
         }
 
         public static string ApplyChoice(Config cfg, Item it, string key, string value)
         {
-            if (key == F_ATLOGON) { it.autostart = (value == V_SILENT); return null; }
             if (key == F_ON) { it.enabled = (value == V_YES); return null; }
             if (key == F_LAUNCHER)
             {
-                var r = Launchers.ResolveFor(it.exe, value, null, cfg.extLaunchers);
+                if (!it.script) return "该字段不可编辑";
+                var r = Launchers.ResolveFor(it.exe, value, cfg.extLaunchers);
                 if (r == null) return "无法解析启动器：" + value;
                 it.launcher = value;
                 it.hostExe = r.Host;
@@ -319,7 +327,7 @@ namespace AppManager.Cli
 
         static void Title(Frame f, string subtitle)
         {
-            f.Add(" am update · " + subtitle + " ", ConsoleColor.White, ConsoleColor.DarkBlue, true);
+            f.Add(" sm update · " + subtitle + " ", ConsoleColor.White, ConsoleColor.DarkBlue, true);
             f.Add(" config: " + Core.CfgPath, ConsoleColor.DarkGray);
             f.Add("", null);
         }
@@ -328,10 +336,10 @@ namespace AppManager.Cli
         public static Frame BuildListFrame(Config cfg, List<Item> items, int sel, string status)
         {
             var f = new Frame();
-            var headers = new[] { "名称", "类型", "登录自启", "启用", "监控时长", "目标" };
+            var headers = new[] { "名称", "类型", "启用", "监控时长", "目标" };
             var rows = new List<string[]>();
             foreach (var it in items)
-                rows.Add(new string[] { it.name, KindText(it), FieldText(it, F_ATLOGON), FieldText(it, F_ON),
+                rows.Add(new string[] { it.name, FieldText(it, F_KIND), FieldText(it, F_ON),
                     it.script ? "-" : FieldText(it, F_MONITOR), it.exe });
 
             var w = new int[headers.Length];
@@ -339,8 +347,8 @@ namespace AppManager.Cli
             foreach (var r in rows)
                 for (int c = 0; c < headers.Length; c++)
                     if (Style.DispWidth(r[c]) > w[c]) w[c] = Style.DispWidth(r[c]);
-            int capTarget = 40;
-            if (w[5] > capTarget) w[5] = capTarget;
+            int capTarget = 50;
+            if (w[4] > capTarget) w[4] = capTarget;
             int total = (headers.Length - 1) * 3;
             for (int c = 0; c < headers.Length; c++) total += w[c];
             f.Width = Math.Max(total, 46);
@@ -397,7 +405,7 @@ namespace AppManager.Cli
             if (vw > 100) vw = 100;
             f.Width = Math.Max(lw + vw + 3, 52);
 
-            Title(f, it.name + " · " + KindText(it));
+            Title(f, it.name);
             f.Add(Style.Fit("字段", lw, false) + " | 值", ConsoleColor.Cyan);
             f.Add(new string('-', Math.Min(f.Width, 100)), ConsoleColor.DarkGray);
 
@@ -432,11 +440,13 @@ namespace AppManager.Cli
 
         public static string SummaryLine(List<Item> items)
         {
-            int apps = 0, scripts = 0;
-            foreach (var it in items) { if (it.script) scripts++; else apps++; }
-            int pid = Core.EnginePid();
-            return "共 " + items.Count + " 项（应用 " + apps + " · 脚本 " + scripts + "）    engine: "
-                + (pid > 0 ? "running (pid " + pid + ")" : "not running");
+            int apps = 0, scripts = 0, on = 0;
+            foreach (var it in items)
+            {
+                if (it.script) scripts++; else apps++;
+                if (it.enabled) on++;
+            }
+            return "共 " + items.Count + " 项（应用 " + apps + " · 脚本 " + scripts + "，启用 " + on + "）";
         }
 
         // ---------- cursor / key handling (pure) ----------
@@ -540,7 +550,7 @@ namespace AppManager.Cli
 
         public static string SavedMessage(Item it, Field fld)
         {
-            return "已保存：" + fld.Label + " = " + FieldText(it, fld.Key) + "（下次登录或 am stop && am run 生效）";
+            return "已保存：" + fld.Label + " = " + FieldText(it, fld.Key) + "（下次登录生效）";
         }
 
         // ---------- console half ----------
@@ -670,6 +680,7 @@ namespace AppManager.Cli
         {
             var st = new EditState();
             st.Buffer = FieldText(it, fld.Key);
+            if (st.Buffer == "(无)" || st.Buffer == V_ALL) st.Buffer = "";
             st.Caret = st.Buffer.Length;
             int width = Math.Max(frame.Width, 46);
             int cw = ConsoleWidth();
@@ -712,7 +723,7 @@ namespace AppManager.Cli
             var items = BuildItems(cfg, only);
             if (items.Count == 0)
             {
-                if (only == null) Style.Warn("(no items configured — add one with: am add <exePath>)");
+                if (only == null) Style.Warn("(no items configured — add one with: sm add <exePath>)");
                 else Style.Err("no item named '" + only + "'");
                 return;
             }
@@ -728,12 +739,12 @@ namespace AppManager.Cli
                 Console.WriteLine();
                 foreach (var it in items)
                 {
-                    Style.Info("  " + it.name + "  (" + KindText(it) + ")");
+                    Style.Info("  " + it.name);
                     foreach (var fld in Fields(it))
                         Console.WriteLine("    " + Style.Fit(fld.Label, 10, false) + " " + FieldText(it, fld.Key));
                     Console.WriteLine();
                 }
-                Style.Dim("(piped output: the editable UI needs a real console — run `am update` there)");
+                Style.Dim("(piped output: the editable UI needs a real console — run `sm update` there)");
                 return;
             }
 
@@ -802,7 +813,7 @@ namespace AppManager.Cli
                 ClearRegion(sc.Lines + 1);
                 try { Console.CursorVisible = true; } catch { }
             }
-            Style.Dim("am update: 退出（已保存的改动即时生效：下次登录，或 am stop && am run）");
+            Style.Dim("sm update: 退出（已保存的改动下次登录生效）");
         }
     }
 }

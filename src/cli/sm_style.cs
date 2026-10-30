@@ -8,7 +8,7 @@ using System.Text;
 // Colour writes go through Console.ForegroundColor/BackgroundColor, which .NET
 // silently ignores when the stream is redirected — piped or logged output stays
 // plain text with no escape sequences.
-namespace AppManager.Cli
+namespace StartManager.Cli
 {
     static class Style
     {

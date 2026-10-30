@@ -1,9 +1,7 @@
 # build outputs / runtime artifacts
 *.exe
 config.json
-am.log
-am-engine.pid
-am-engine.stop.txt
+sm.log
 tests/bin/
 
 # dev-process docs (local only, not for the public repo)
