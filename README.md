@@ -6,9 +6,9 @@
   只做一件事：按你的配置在登录时拉起应用并藏好窗口；引擎跑完就退出。</strong>
 </p>
 
-![GitHub stars](https://img.shields.io/github/stars/wuhaostudio/AppManager?style=flat-square)
-![GitHub forks](https://img.shields.io/github/forks/wuhaostudio/AppManager?style=flat-square)
-![GitHub issues](https://img.shields.io/github/issues/wuhaostudio/AppManager?style=flat-square)
+![GitHub stars](https://img.shields.io/github/stars/wuhaostudio/StartManager?style=flat-square)
+![GitHub forks](https://img.shields.io/github/forks/wuhaostudio/StartManager?style=flat-square)
+![GitHub issues](https://img.shields.io/github/issues/wuhaostudio/StartManager?style=flat-square)
 ![Language C#](https://img.shields.io/badge/language-C%23-68267B?style=flat-square)
 ![Platform Windows](https://img.shields.io/badge/platform-Windows-0078D6?style=flat-square)
 ![Runtime .NET Framework 4.x](https://img.shields.io/badge/runtime-.NET%20Framework%204.x-512BD4?style=flat-square)
@@ -237,7 +237,7 @@ sm launchers forget .lua
 ## 项目结构
 
 ```
-C:\project\AppManager\              ← 开发/源码（仓库根目录；产品名 StartManager）
+C:\project\StartManager\            ← 开发/源码（仓库根目录；产品名 StartManager）
 ├── src\
 │   ├── shared\sm_shared.cs         # 配置模型、启动器解析/学习、P/Invoke、DoPass
 │   ├── cli\sm_cli.cs               # CLI 入口（add / update / remove / list / launchers）

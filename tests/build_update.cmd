@@ -3,7 +3,7 @@ rem Compile the `sm update` editor harness (model + keys + line editor).
 rem No UI frameworks / GAC UIA: the minimal product only links sm_shared + the CLI.
 set CSP=C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe
 set FW=C:\Windows\Microsoft.NET\Framework64\v4.0.30319
-set DEV=C:\project\AppManager
+set DEV=C:\project\StartManager
 if not exist "%DEV%\tests\bin" mkdir "%DEV%\tests\bin"
 "%CSP%" /nologo /codepage:65001 /target:exe /main:UpdateTest /out:"%DEV%\tests\bin\update_test.exe" ^
  /r:"%FW%\System.dll" ^

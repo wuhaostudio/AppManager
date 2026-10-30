@@ -6,9 +6,9 @@
   It does one thing: at logon, start the configured apps and hide their windows; the engine then exits.</strong>
 </p>
 
-![GitHub stars](https://img.shields.io/github/stars/wuhaostudio/AppManager?style=flat-square)
-![GitHub forks](https://img.shields.io/github/forks/wuhaostudio/AppManager?style=flat-square)
-![GitHub issues](https://img.shields.io/github/issues/wuhaostudio/AppManager?style=flat-square)
+![GitHub stars](https://img.shields.io/github/stars/wuhaostudio/StartManager?style=flat-square)
+![GitHub forks](https://img.shields.io/github/forks/wuhaostudio/StartManager?style=flat-square)
+![GitHub issues](https://img.shields.io/github/issues/wuhaostudio/StartManager?style=flat-square)
 ![Language C#](https://img.shields.io/badge/language-C%23-68267B?style=flat-square)
 ![Platform Windows](https://img.shields.io/badge/platform-Windows-0078D6?style=flat-square)
 ![Runtime .NET Framework 4.x](https://img.shields.io/badge/runtime-.NET%20Framework%204.x-512BD4?style=flat-square)
@@ -237,7 +237,7 @@ It does not distinguish "already running" from "cold start": a window that pops 
 ## Project layout
 
 ```
-C:\project\AppManager\              ← dev / source (repo root; product name: StartManager)
+C:\project\StartManager\            ← dev / source (repo root; product name: StartManager)
 ├── src\
 │   ├── shared\sm_shared.cs         # config model, launcher resolution/learning, P/Invoke, DoPass
 │   ├── cli\sm_cli.cs               # CLI entry (add / update / remove / list / launchers)

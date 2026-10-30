@@ -1,5 +1,5 @@
 $ErrorActionPreference='Continue'
-# Build script (lives in the DEV directory: C:\project\AppManager).
+# Build script (lives in the DEV directory: C:\project\StartManager).
 # Compiles src\shared + src\cli -> sm.exe and src\shared + src\engine ->
 # sm-engine.exe, output to the DEPLOY directory (%LOCALAPPDATA%\StartManager).
 $devDir   = $PSScriptRoot
